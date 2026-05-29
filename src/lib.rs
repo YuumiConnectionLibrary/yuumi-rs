@@ -2,28 +2,38 @@
 //!
 //! Rust SDK for the [Yuumi IPC protocol v2](https://github.com/YuumiConnectionLibrary/yuumi-spec).
 //!
-//! ## Planned public API
+//! ## Quick start
 //!
 //! ```rust,ignore
-//! use yuumi::{Client, Channel, ReconnectPolicy};
+//! use yuumi::{connect, Channel};
 //!
 //! #[tokio::main]
-//! async fn main() -> yuumi::Result<()> {
-//!     let client = Client::connect("my-service").await?;
-//!
-//!     client.on_message(|data, channel| {
-//!         println!("received on {channel:?}: {data:?}");
-//!     });
-//!
-//!     client.send(serde_json::json!({"status": "ready"}), Channel::Command).await?;
-//!
-//!     let (data, channel) = client.receive().await?;
-//!     println!("{data:?} on {channel:?}");
-//!
-//!     client.close().await
+//! async fn main() -> yuumi::types::Result<()> {
+//!     let client = connect("my-service", None).await?;
+//!     client.on_message(|data, ch| println!("{ch:?}: {data}"));
+//!     client.listen().await;
+//!     client.send(serde_json::json!({"status":"ready"}), Channel::Command).await?;
+//!     let (data, ch) = client.receive().await?;
+//!     println!("{ch:?}: {data}");
+//!     client.close().await;
+//!     Ok(())
 //! }
 //! ```
-//!
-//! See [yuumi-spec](https://github.com/YuumiConnectionLibrary/yuumi-spec) for the wire format.
 
-// Implementation pending — see yuumi-spec for protocol details.
+pub mod types;
+pub mod protocol;
+pub mod transport;
+pub mod client;
+pub mod diagnostic;
+
+pub use types::{
+    Channel, Encoding, ReconnectPolicy, Result, StatusCode, YuumiError,
+    MAGIC, PROTOCOL_VERSION, MAX_MESSAGE_SIZE, MAX_PIPE_NAME_BYTES,
+};
+pub use client::{Client, MessageHandler, HeartbeatHandler, ErrorHandler, connect};
+pub use diagnostic::Diagnostic;
+pub use protocol::{
+    build_handshake_packet, encode_payload, decode_payload, build_frame,
+    read_frame, perform_handshake,
+};
+pub use transport::resolve_transport_address;
