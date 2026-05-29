@@ -1,0 +1,19 @@
+[package]
+name = "yuumi"
+version = "0.1.0"
+edition = "2021"
+description = "Rust SDK for the Yuumi IPC protocol v2"
+license = "MIT"
+repository = "https://github.com/YuumiConnectionLibrary/yuumi-rs"
+keywords = ["ipc", "unix-socket", "protocol", "yuumi"]
+categories = ["network-programming"]
+
+[dependencies]
+# msgpack encoding — to be added during implementation
+# rmp-serde = "1"
+# serde = { version = "1", features = ["derive"] }
+# serde_json = "1"
+# tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+# tokio = { version = "1", features = ["test-util"] }
