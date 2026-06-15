@@ -2,6 +2,29 @@
 
 > **Work in progress** — Rust SDK for the [Yuumi IPC protocol](https://github.com/YuumiConnectionLibrary/yuumi-spec).
 
+## Transport verification (Windows)
+
+Result: **`tokio::net::UnixStream` is not available as a portable v1 transport on Windows for yuumi-rs**.
+
+- In Tokio source, `UnixStream` is exported behind `cfg_net_unix!` (`cfg(all(unix, feature = "net"))`).
+- Windows transport APIs are in `tokio::net::windows` (Named Pipe family), not `tokio::net::UnixStream`.
+- Local verification on Windows target:
+  - `cargo check --target x86_64-pc-windows-msvc`
+  - Result: `error[E0432]: unresolved import tokio::net::UnixStream` (symbol gated out by `cfg(all(unix, feature = "net"))`)
+
+Decision fixed for v1: **Option 2** — `yuumi-rs` v1 supports Linux/macOS only.
+
+## Platform support matrix
+
+| Platform | Transport | v1 support | Notes |
+|---|---|---|---|
+| Linux | AF_UNIX | ✅ | Primary target |
+| macOS | AF_UNIX | ✅ | Primary target |
+| Windows | AF_UNIX / Named Pipe | ❌ | Not supported in v1 to preserve AF_UNIX transport invariant |
+
+> Project invariant: one transport family (`AF_UNIX`) across supported platforms.
+> Windows support is intentionally deferred to a future version as an explicit exception.
+
 ## Planned API
 
 ```rust
@@ -63,7 +86,7 @@ let client = Client::connect_with_policy("my-service", ReconnectPolicy {
 
 ## Planned dependencies
 
-- [`tokio`](https://tokio.rs) — async runtime + Unix socket I/O
+- [`tokio`](https://tokio.rs) — async runtime + Unix socket I/O (Linux/macOS v1)
 - [`serde_json`](https://github.com/serde-rs/json) — JSON encoding
 - [`rmp-serde`](https://github.com/3Hren/msgpack-rust) — MsgPack encoding
 

@@ -7,6 +7,10 @@ license = "MIT"
 repository = "https://github.com/YuumiConnectionLibrary/yuumi-rs"
 keywords = ["ipc", "unix-socket", "protocol", "yuumi"]
 categories = ["network-programming"]
+# v1 platform policy: AF_UNIX transport only (Linux/macOS). Windows is intentionally unsupported in v1.
+
+[package.metadata.yuumi]
+platform_support = "v1: linux/macos supported; windows unsupported (AF_UNIX invariant)"
 
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
