@@ -1,116 +1,132 @@
-use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use serde::Serialize;
+use serde_json::{Map, Value};
 
-use crate::types::{
-    Channel, Encoding, StatusCode, YuumiError, MAGIC, MAX_MESSAGE_SIZE, PROTOCOL_VERSION,
-};
+use crate::types::{Channel, Encoding, ErrorCategory, ErrorPhase, StatusCode, MAX_MESSAGE_SIZE};
 
-/// Build the 16-byte handshake packet (Big-Endian).
-pub fn build_handshake_packet(pid: u32) -> [u8; 16] {
-    let mut p = [0u8; 16];
-    p[0..4].copy_from_slice(&MAGIC.to_be_bytes());
-    p[4..8].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
-    p[8..12].copy_from_slice(&pid.to_be_bytes());
-    p[12] = 0x03; // EncodingCaps: JSON | MsgPack
-                  // p[13..16] = 0 (reserved)
-    p
+pub(crate) const FLAG_FRAGMENT: u8 = 0x01;
+pub(crate) const FLAG_LAST_FRAGMENT: u8 = 0x02;
+pub(crate) const FLAG_CORRELATED: u8 = 0x04;
+pub(crate) const KNOWN_FLAGS: u8 = FLAG_FRAGMENT | FLAG_LAST_FRAGMENT | FLAG_CORRELATED;
+
+#[derive(Debug)]
+pub(crate) struct ProtocolFailure {
+    pub status: StatusCode,
+    pub phase: ErrorPhase,
+    pub cause: String,
 }
 
-pub fn encode_payload(value: &Value, encoding: Encoding) -> crate::types::Result<Vec<u8>> {
-    match encoding {
-        Encoding::Json => serde_json::to_vec(value)
-            .map_err(|e| YuumiError::new(StatusCode::ErrInternal, e.to_string())),
-        Encoding::MsgPack => rmp_serde::to_vec_named(value)
-            .map_err(|e| YuumiError::new(StatusCode::ErrInternal, e.to_string())),
+impl ProtocolFailure {
+    pub fn new(status: StatusCode, phase: ErrorPhase, cause: impl Into<String>) -> Self {
+        Self {
+            status,
+            phase,
+            cause: cause.into(),
+        }
     }
 }
 
-pub fn decode_payload(bytes: &[u8], encoding: Encoding) -> crate::types::Result<Value> {
+pub(crate) fn encode_payload<T: Serialize + ?Sized>(
+    value: &T,
+    encoding: Encoding,
+) -> std::result::Result<Vec<u8>, ProtocolFailure> {
     match encoding {
-        Encoding::Json => serde_json::from_slice(bytes)
-            .map_err(|e| YuumiError::new(StatusCode::ErrInternal, e.to_string())),
-        Encoding::MsgPack => rmp_serde::from_slice(bytes)
-            .map_err(|e| YuumiError::new(StatusCode::ErrInternal, e.to_string())),
+        Encoding::Json => serde_json::to_vec(value).map_err(|error| {
+            ProtocolFailure::new(
+                StatusCode::ErrProtocolViolation,
+                ErrorPhase::ApplicationSend,
+                format!("payload serialization failed: {error}"),
+            )
+        }),
+        Encoding::MessagePack => rmp_serde::to_vec_named(value).map_err(|error| {
+            ProtocolFailure::new(
+                StatusCode::ErrProtocolViolation,
+                ErrorPhase::ApplicationSend,
+                format!("payload serialization failed: {error}"),
+            )
+        }),
     }
 }
 
-pub fn build_frame(value: &Value, channel: Channel, encoding: Encoding) -> crate::types::Result<Vec<u8>> {
-    let payload = encode_payload(value, encoding)?;
+pub(crate) fn decode_payload(
+    payload: &[u8],
+    encoding: Encoding,
+) -> std::result::Result<Value, ProtocolFailure> {
+    let failure = || {
+        ProtocolFailure::new(
+            StatusCode::ErrProtocolViolation,
+            ErrorPhase::FrameDecode,
+            "application payload cannot be decoded with the negotiated encoding",
+        )
+    };
+    match encoding {
+        Encoding::Json => serde_json::from_slice(payload).map_err(|_| failure()),
+        Encoding::MessagePack => rmp_serde::from_slice(payload).map_err(|_| failure()),
+    }
+}
+
+pub(crate) fn decode_control(
+    payload: &[u8],
+) -> std::result::Result<Map<String, Value>, ProtocolFailure> {
+    let value: Value = serde_json::from_slice(payload).map_err(|_| {
+        ProtocolFailure::new(
+            StatusCode::ErrProtocolViolation,
+            ErrorPhase::FrameDecode,
+            "Control payload is not valid JSON",
+        )
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        ProtocolFailure::new(
+            StatusCode::ErrProtocolViolation,
+            ErrorPhase::FrameDecode,
+            "Control payload must be an object with a string type",
+        )
+    })?;
+    if !object.get("type").is_some_and(Value::is_string) {
+        return Err(ProtocolFailure::new(
+            StatusCode::ErrProtocolViolation,
+            ErrorPhase::FrameDecode,
+            "Control payload must be an object with a string type",
+        ));
+    }
+    Ok(object.clone())
+}
+
+pub(crate) fn build_frame(
+    channel: Channel,
+    flags: u8,
+    payload: &[u8],
+) -> std::result::Result<Vec<u8>, ProtocolFailure> {
+    if payload.len() > MAX_MESSAGE_SIZE {
+        return Err(ProtocolFailure::new(
+            StatusCode::ErrPayloadTooLarge,
+            ErrorPhase::ApplicationSend,
+            "frame payload exceeds 16 MiB",
+        ));
+    }
     let mut frame = Vec::with_capacity(6 + payload.len());
     frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     frame.push(channel as u8);
-    frame.push(0u8); // flags
-    frame.extend_from_slice(&payload);
+    frame.push(flags);
+    frame.extend_from_slice(payload);
     Ok(frame)
 }
 
-pub async fn read_frame<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    encoding: Encoding,
-) -> crate::types::Result<(Value, Channel)> {
-    let mut header = [0u8; 6];
-    reader.read_exact(&mut header).await.map_err(|e| {
-        if e.kind() == std::io::ErrorKind::UnexpectedEof || e.kind() == std::io::ErrorKind::ConnectionReset {
-            YuumiError::new(StatusCode::ErrConnectionLost, "connection closed")
-        } else {
-            YuumiError::new(StatusCode::ErrConnectionLost, e.to_string())
-        }
-    })?;
-
-    let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
-    let channel_byte = header[4];
-    let flags = header[5];
-
-    if flags != 0 {
-        return Err(YuumiError::new(
-            StatusCode::ErrProtocolViolation,
-            format!("frame flags must be 0x00, got 0x{flags:02x}"),
-        ));
-    }
-    if length > MAX_MESSAGE_SIZE {
-        return Err(YuumiError::new(StatusCode::ErrProtocolViolation, "payload too large"));
-    }
-
-    let channel = Channel::try_from(channel_byte).map_err(|_| {
-        YuumiError::new(StatusCode::ErrProtocolViolation, format!("unknown channel: {channel_byte}"))
-    })?;
-
-    let mut body = vec![0u8; length];
-    reader.read_exact(&mut body).await.map_err(|e| {
-        YuumiError::new(StatusCode::ErrConnectionLost, e.to_string())
-    })?;
-
-    let value = decode_payload(&body, encoding)?;
-    Ok((value, channel))
+pub(crate) fn build_control_frame<T: Serialize + ?Sized>(
+    value: &T,
+) -> std::result::Result<Vec<u8>, ProtocolFailure> {
+    let payload = encode_payload(value, Encoding::Json)?;
+    build_frame(Channel::Control, 0, &payload)
 }
 
-/// Send the handshake and read the 4-byte ACK. Returns the negotiated `Encoding`.
-pub async fn perform_handshake<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: &mut S,
-) -> crate::types::Result<Encoding> {
-    let pid = std::process::id();
-    let packet = build_handshake_packet(pid);
-
-    stream.write_all(&packet).await.map_err(|e| {
-        YuumiError::new(StatusCode::ErrWriteFailed, format!("handshake write failed: {e}"))
-    })?;
-
-    let mut ack = [0u8; 4];
-    stream.read_exact(&mut ack).await.map_err(|e| {
-        YuumiError::new(StatusCode::ErrMagicMismatch, format!("ACK not received: {e}"))
-    })?;
-
-    if ack[1] != 0 || ack[2] != 0 || ack[3] != 0 {
-        return Err(YuumiError::new(
-            StatusCode::ErrProtocolViolation,
-            "ACK reserved bytes must be 0x00",
-        ));
-    }
-
-    Encoding::try_from(ack[0]).map_err(|_| {
-        YuumiError::new(
-            StatusCode::ErrProtocolViolation,
-            format!("unknown encoding in ACK: 0x{:02x}", ack[0]),
-        )
-    })
+pub(crate) fn serialization_error(
+    failure: ProtocolFailure,
+    session: crate::types::SessionHandle,
+) -> crate::types::EngineError {
+    crate::types::EngineError::new(
+        ErrorCategory::Serialization,
+        failure.status,
+        failure.phase,
+        failure.cause,
+        Some(session),
+    )
 }

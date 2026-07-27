@@ -2,15 +2,15 @@
 name = "yuumi"
 version = "0.1.0"
 edition = "2021"
-description = "Rust SDK for the Yuumi IPC protocol v2"
+description = "Rust engine SDK for the Yuumi IPC protocol"
 license = "MIT"
 repository = "https://github.com/YuumiConnectionLibrary/yuumi-rs"
-keywords = ["ipc", "unix-socket", "protocol", "yuumi"]
+keywords = ["ipc", "named-pipe", "protocol", "yuumi"]
 categories = ["network-programming"]
-# v1 platform policy: AF_UNIX transport only (Linux/macOS). Windows is intentionally unsupported in v1.
 
 [package.metadata.yuumi]
-platform_support = "v1: linux/macos supported; windows unsupported (AF_UNIX invariant)"
+role = "engine"
+platform_support = "linux/macos: Unix domain socket; windows: Named Pipe"
 
 [dependencies]
 tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
