@@ -1,12 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::protocol::{
@@ -14,39 +16,33 @@ use crate::protocol::{
     serialization_error, ProtocolFailure, FLAG_CORRELATED, FLAG_FRAGMENT, FLAG_LAST_FRAGMENT,
     KNOWN_FLAGS,
 };
-use crate::transport::{resolve_transport_address, BoxStream, PlatformListener};
+use crate::transport::{dial_local, resolve_transport_address, BoxStream};
 use crate::types::*;
 
 #[derive(Default, Clone)]
 struct Callbacks {
     connected: Option<ConnectedCallback>,
     message: Option<MessageCallback>,
+    heartbeat: Option<HeartbeatCallback>,
     error: Option<ErrorCallback>,
     disconnected: Option<DisconnectedCallback>,
 }
 
-#[derive(Default)]
-struct Lifecycle {
-    open: bool,
-    accept_task: Option<JoinHandle<()>>,
-    maintenance_task: Option<JoinHandle<()>>,
-    address: Option<std::path::PathBuf>,
+struct Attempt {
+    cancelled: AtomicBool,
+    notify: Notify,
 }
-
-struct Connection {
-    writer: AsyncMutex<WriteHalf<BoxStream>>,
-    close: Notify,
-    closing: AtomicBool,
-}
-
-impl Connection {
-    fn request_close(&self) {
-        if !self.closing.swap(true, Ordering::AcqRel) {
-            self.close.notify_one();
-        }
+impl Attempt {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
     }
 }
 
+struct StateData {
+    state: EngineState,
+    attempt: Option<Arc<Attempt>>,
+}
 struct Fragment {
     id: u32,
     correlation_id: Option<u32>,
@@ -54,30 +50,76 @@ struct Fragment {
     deadline: Instant,
 }
 
+enum DispatchItem {
+    Connected(SessionView, bool),
+    Message(MessageEvent, bool),
+    Heartbeat(HeartbeatEvent, bool),
+    Error(ErrorInfo, bool),
+    Disconnected(DisconnectEvent),
+}
+
+impl DispatchItem {
+    fn uses_capacity(&self) -> bool {
+        match self {
+            Self::Connected(_, value)
+            | Self::Message(_, value)
+            | Self::Heartbeat(_, value)
+            | Self::Error(_, value) => *value,
+            Self::Disconnected(_) => false,
+        }
+    }
+}
+
+struct DispatchState {
+    items: VecDeque<DispatchItem>,
+    capacity_used: usize,
+    accepting: bool,
+    finalized: bool,
+}
+
+struct DispatchQueue {
+    state: Mutex<DispatchState>,
+    notify: Notify,
+    capacity: usize,
+}
+
 struct Session {
-    connection: Arc<Connection>,
-    handle: SessionHandle,
-    encoding: Encoding,
-    capabilities: u32,
+    view: SessionView,
+    config: EngineConfig,
+    writer: AsyncMutex<WriteHalf<BoxStream>>,
+    close: Notify,
+    closing: AtomicBool,
+    finalized: AtomicBool,
     fragments: Mutex<HashMap<Channel, Fragment>>,
     last_activity: Mutex<Instant>,
     last_heartbeat: Mutex<Instant>,
-    event_gate: Mutex<()>,
-    terminal_reported: AtomicBool,
-    disconnect_reason: Mutex<DisconnectReason>,
+    terminal: Mutex<Option<TerminalResult>>,
+    dispatch: DispatchQueue,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl Session {
+    fn request_close(&self) {
+        if !self.closing.swap(true, Ordering::AcqRel) {
+            self.close.notify_waiters();
+        }
+    }
+    fn set_terminal(&self, reason: DisconnectReason, error: Option<ErrorInfo>) {
+        let mut terminal = lock(&self.terminal);
+        if terminal.is_none() {
+            *terminal = Some(TerminalResult { reason, error });
+        }
+    }
 }
 
 struct Inner {
-    config: EngineConfig,
-    lifecycle: AsyncMutex<Lifecycle>,
+    source_config: EngineConfig,
+    state: Mutex<StateData>,
+    session: Mutex<Option<Arc<Session>>>,
+    terminal_result: Mutex<Option<TerminalResult>>,
     callbacks: RwLock<Callbacks>,
-    accepting: AtomicBool,
-    capacity: Arc<Semaphore>,
-    connections: Mutex<HashMap<u64, Arc<Connection>>>,
-    sessions: Mutex<HashMap<String, Arc<Session>>>,
-    workers: Mutex<Vec<JoinHandle<()>>>,
-    next_connection: AtomicU64,
     next_epoch: AtomicU64,
+    attempt_done: Notify,
 }
 
 #[derive(Clone)]
@@ -85,30 +127,94 @@ pub struct Engine {
     inner: Arc<Inner>,
 }
 
+#[derive(Clone)]
+pub struct Responder {
+    inner: Arc<ResponderInner>,
+}
+struct ResponderInner {
+    engine: Weak<Inner>,
+    epoch: u64,
+    correlation_id: u32,
+    used: AtomicBool,
+}
+
+impl fmt::Debug for Responder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Responder")
+            .field("epoch", &self.inner.epoch)
+            .field("correlation_id", &self.inner.correlation_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Responder {
+    pub async fn respond<T: Serialize + ?Sized>(&self, payload: &T) -> Result<()> {
+        if self.inner.used.swap(true, Ordering::AcqRel) {
+            return Err(engine_error(
+                ErrorKind::StaleEpoch,
+                "responder is single-use",
+                StatusCode::ErrProtocolViolation,
+                ErrorPhase::ApplicationSend,
+                Some(self.inner.epoch),
+            ));
+        }
+        let engine = self.inner.engine.upgrade().ok_or_else(|| {
+            engine_error(
+                ErrorKind::StaleEpoch,
+                "responder belongs to a dropped engine",
+                StatusCode::ErrConnectionLost,
+                ErrorPhase::ApplicationSend,
+                Some(self.inner.epoch),
+            )
+        })?;
+        respond_inner(
+            &engine,
+            self.inner.epoch,
+            self.inner.correlation_id,
+            payload,
+        )
+        .await
+    }
+}
+
 impl Engine {
     pub fn new(config: EngineConfig) -> Self {
-        let capacity = config.max_sessions.max(1);
         Self {
             inner: Arc::new(Inner {
-                config,
-                lifecycle: AsyncMutex::new(Lifecycle::default()),
+                source_config: config,
+                state: Mutex::new(StateData {
+                    state: EngineState::Idle,
+                    attempt: None,
+                }),
+                session: Mutex::new(None),
+                terminal_result: Mutex::new(None),
                 callbacks: RwLock::new(Callbacks::default()),
-                accepting: AtomicBool::new(false),
-                capacity: Arc::new(Semaphore::new(capacity)),
-                connections: Mutex::new(HashMap::new()),
-                sessions: Mutex::new(HashMap::new()),
-                workers: Mutex::new(Vec::new()),
-                next_connection: AtomicU64::new(0),
                 next_epoch: AtomicU64::new(0),
+                attempt_done: Notify::new(),
             }),
         }
     }
 
+    pub fn state(&self) -> EngineState {
+        lock(&self.inner.state).state
+    }
+    pub fn session(&self) -> Option<SessionView> {
+        lock(&self.inner.session)
+            .as_ref()
+            .map(|session| session.view.clone())
+    }
+    pub fn terminal_result(&self) -> Option<TerminalResult> {
+        lock(&self.inner.terminal_result).clone()
+    }
     pub fn on_session_connected(&self, callback: ConnectedCallback) {
         write_lock(&self.inner.callbacks).connected = Some(callback);
     }
     pub fn on_message(&self, callback: MessageCallback) {
         write_lock(&self.inner.callbacks).message = Some(callback);
+    }
+    pub fn on_heartbeat(&self, callback: HeartbeatCallback) {
+        write_lock(&self.inner.callbacks).heartbeat = Some(callback);
     }
     pub fn on_error(&self, callback: ErrorCallback) {
         write_lock(&self.inner.callbacks).error = Some(callback);
@@ -117,503 +223,440 @@ impl Engine {
         write_lock(&self.inner.callbacks).disconnected = Some(callback);
     }
 
-    pub async fn open(&self) -> Result<()> {
-        let mut lifecycle = self.inner.lifecycle.lock().await;
-        if lifecycle.open {
-            return Err(EngineError::new(
-                ErrorCategory::Endpoint,
-                StatusCode::ErrPipeFailed,
-                ErrorPhase::EndpointOpen,
-                "engine is already open",
-                None,
-            ));
+    pub async fn connect(&self) -> Result<SessionView> {
+        let config = self.inner.source_config.clone();
+        if let Err(error) = validate_config(&config) {
+            emit_pre_session_error(&self.inner, error.info.clone());
+            return Err(error);
         }
-        validate_config(&self.inner.config)?;
-        let address =
-            resolve_transport_address(&self.inner.config.endpoint_name, &self.inner.config.token)?;
-        let listener = PlatformListener::open(&address).await?;
-        self.inner.accepting.store(true, Ordering::Release);
-        let accept_inner = Arc::clone(&self.inner);
-        let accept_task = tokio::spawn(async move { accept_loop(accept_inner, listener).await });
-        let maintenance_inner = Arc::clone(&self.inner);
-        let maintenance_task =
-            tokio::spawn(async move { maintenance_loop(maintenance_inner).await });
-        lifecycle.address = Some(address);
-        lifecycle.accept_task = Some(accept_task);
-        lifecycle.maintenance_task = Some(maintenance_task);
-        lifecycle.open = true;
-        Ok(())
+        let address = match resolve_transport_address(&config.endpoint_name, &config.token) {
+            Ok(value) => value,
+            Err(error) => {
+                emit_pre_session_error(&self.inner, error.info.clone());
+                return Err(error);
+            }
+        };
+        let attempt = Arc::new(Attempt {
+            cancelled: AtomicBool::new(false),
+            notify: Notify::new(),
+        });
+        {
+            let mut state = lock(&self.inner.state);
+            match state.state {
+                EngineState::Idle => {
+                    state.state = EngineState::Connecting;
+                    state.attempt = Some(Arc::clone(&attempt));
+                    *lock(&self.inner.terminal_result) = None;
+                }
+                EngineState::Connecting => return Err(state_error("engine is already connecting")),
+                EngineState::Connected | EngineState::Closing => {
+                    return Err(state_error("engine is already connected or closing"));
+                }
+            }
+        }
+        let outcome = tokio::time::timeout(
+            config.connect_timeout,
+            connect_attempt(&self.inner, &config, &address, &attempt),
+        )
+        .await;
+        let result = outcome.unwrap_or_else(|_| {
+            Err(engine_error(
+                ErrorKind::Timeout,
+                "connect and handshake attempt timed out",
+                StatusCode::ErrReadTimeout,
+                ErrorPhase::Dial,
+                None,
+            ))
+        });
+        match result {
+            Ok((reader, writer, view)) => {
+                let session = Arc::new(Session {
+                    view: view.clone(),
+                    config: config.clone(),
+                    writer: AsyncMutex::new(writer),
+                    close: Notify::new(),
+                    closing: AtomicBool::new(false),
+                    finalized: AtomicBool::new(false),
+                    fragments: Mutex::new(HashMap::new()),
+                    last_activity: Mutex::new(Instant::now()),
+                    last_heartbeat: Mutex::new(Instant::now()),
+                    terminal: Mutex::new(None),
+                    dispatch: DispatchQueue {
+                        state: Mutex::new(DispatchState {
+                            items: VecDeque::new(),
+                            capacity_used: 0,
+                            accepting: true,
+                            finalized: false,
+                        }),
+                        notify: Notify::new(),
+                        capacity: config.application_queue_capacity,
+                    },
+                    workers: Mutex::new(Vec::new()),
+                });
+                {
+                    let mut state = lock(&self.inner.state);
+                    if state.state != EngineState::Connecting
+                        || attempt.cancelled.load(Ordering::Acquire)
+                    {
+                        state.state = EngineState::Idle;
+                        state.attempt = None;
+                        self.inner.attempt_done.notify_waiters();
+                        return Err(local_close_error());
+                    }
+                    state.state = EngineState::Connected;
+                    state.attempt = None;
+                    *lock(&self.inner.session) = Some(Arc::clone(&session));
+                }
+                start_session(&self.inner, &session, reader);
+                self.inner.attempt_done.notify_waiters();
+                Ok(view)
+            }
+            Err(error) => {
+                let local_close = {
+                    let mut state = lock(&self.inner.state);
+                    let value = state.state == EngineState::Closing
+                        || attempt.cancelled.load(Ordering::Acquire);
+                    state.state = EngineState::Idle;
+                    state.attempt = None;
+                    value
+                };
+                self.inner.attempt_done.notify_waiters();
+                if local_close {
+                    Err(local_close_error())
+                } else {
+                    emit_pre_session_error(&self.inner, error.info.clone());
+                    Err(error)
+                }
+            }
+        }
     }
 
     pub async fn close(&self) -> Result<()> {
-        let mut lifecycle = self.inner.lifecycle.lock().await;
-        if !lifecycle.open {
-            return Ok(());
-        }
-        lifecycle.open = false;
-        self.inner.accepting.store(false, Ordering::Release);
-        if let Some(task) = lifecycle.accept_task.take() {
-            task.abort();
-            let _ = task.await;
-        }
-        if let Some(task) = lifecycle.maintenance_task.take() {
-            task.abort();
-            let _ = task.await;
-        }
-        let sessions: Vec<_> = lock(&self.inner.sessions).values().cloned().collect();
-        for session in sessions {
-            *lock(&session.disconnect_reason) = DisconnectReason::EngineClose;
-        }
-        let connections: Vec<_> = lock(&self.inner.connections).values().cloned().collect();
-        for connection in connections {
-            connection.request_close();
-        }
-        let workers = std::mem::take(&mut *lock(&self.inner.workers));
-        for worker in workers {
-            let _ = worker.await;
-        }
-        lock(&self.inner.connections).clear();
-        lock(&self.inner.sessions).clear();
-        #[cfg(unix)]
-        if let Some(address) = lifecycle.address.take() {
-            match std::fs::remove_file(address) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(EngineError::new(
-                        ErrorCategory::Endpoint,
-                        StatusCode::ErrPipeFailed,
-                        ErrorPhase::Close,
-                        format!("endpoint removal failed: {error}"),
-                        None,
-                    ))
+        let (attempt, session) = {
+            let mut state = lock(&self.inner.state);
+            match state.state {
+                EngineState::Idle => return Ok(()),
+                EngineState::Connecting => {
+                    state.state = EngineState::Closing;
+                    (state.attempt.clone(), None)
                 }
+                EngineState::Connected => {
+                    state.state = EngineState::Closing;
+                    (None, lock(&self.inner.session).clone())
+                }
+                EngineState::Closing => (state.attempt.clone(), lock(&self.inner.session).clone()),
+            }
+        };
+        if let Some(attempt) = attempt {
+            attempt.cancel();
+            loop {
+                if lock(&self.inner.state).state == EngineState::Idle {
+                    return Ok(());
+                }
+                self.inner.attempt_done.notified().await;
             }
         }
-        #[cfg(windows)]
-        {
-            lifecycle.address = None;
-        }
-        Ok(())
+        let Some(session) = session else {
+            return Ok(());
+        };
+        session.set_terminal(DisconnectReason::LocalClose, None);
+        stop_accepting(&session);
+        session.request_close();
+        join_workers(&session).await
     }
 
-    pub async fn send<T: Serialize + ?Sized>(
-        &self,
-        session: &SessionHandle,
-        channel: Channel,
-        payload: &T,
-    ) -> Result<()> {
-        self.send_inner(session, channel, None, payload).await
-    }
-
-    pub async fn send_correlated<T: Serialize + ?Sized>(
-        &self,
-        session: &SessionHandle,
-        channel: Channel,
-        correlation_id: u32,
-        payload: &T,
-    ) -> Result<()> {
-        self.send_inner(session, channel, Some(correlation_id), payload)
-            .await
-    }
-
-    async fn send_inner<T: Serialize + ?Sized>(
-        &self,
-        handle: &SessionHandle,
-        channel: Channel,
-        correlation_id: Option<u32>,
-        payload: &T,
-    ) -> Result<()> {
+    pub async fn send<T: Serialize + ?Sized>(&self, channel: Channel, payload: &T) -> Result<()> {
         if !matches!(channel, Channel::Log | Channel::Data) {
-            return Err(EngineError::new(
-                ErrorCategory::Session,
-                StatusCode::ErrProtocolViolation,
-                ErrorPhase::ApplicationSend,
+            return Err(engine_error(
+                ErrorKind::Protocol,
                 "engine applications may send only Log or Data",
-                Some(handle.clone()),
-            ));
-        }
-        let session = lock(&self.inner.sessions)
-            .get(&handle.session_id)
-            .filter(|session| {
-                session.handle == *handle && !session.connection.closing.load(Ordering::Acquire)
-            })
-            .cloned()
-            .ok_or_else(|| {
-                EngineError::new(
-                    ErrorCategory::Session,
-                    StatusCode::ErrConnectionLost,
-                    ErrorPhase::ApplicationSend,
-                    "session handle is absent, closed, or stale",
-                    Some(handle.clone()),
-                )
-            })?;
-        if correlation_id.is_some() && session.capabilities & CAP_CORRELATION == 0 {
-            return Err(EngineError::new(
-                ErrorCategory::Session,
                 StatusCode::ErrProtocolViolation,
                 ErrorPhase::ApplicationSend,
-                "correlation was not negotiated",
-                Some(handle.clone()),
+                self.session().map(|session| session.epoch),
             ));
         }
-        let encoded = encode_payload(payload, session.encoding)
-            .map_err(|failure| serialization_error(failure, handle.clone()))?;
-        let prefix_size = usize::from(correlation_id.is_some()) * 4;
-        if encoded.len() > MAX_MESSAGE_SIZE - prefix_size {
-            return Err(EngineError::new(
-                ErrorCategory::Serialization,
-                StatusCode::ErrPayloadTooLarge,
-                ErrorPhase::ApplicationSend,
-                "encoded frame exceeds 16 MiB",
-                Some(handle.clone()),
-            ));
-        }
-        let mut framed_payload = Vec::with_capacity(prefix_size + encoded.len());
-        if let Some(identifier) = correlation_id {
-            framed_payload.extend_from_slice(&identifier.to_be_bytes());
-        }
-        framed_payload.extend_from_slice(&encoded);
-        let packet = build_frame(
-            channel,
-            if correlation_id.is_some() {
-                FLAG_CORRELATED
-            } else {
-                0
-            },
-            &framed_payload,
-        )
-        .map_err(|failure| serialization_error(failure, handle.clone()))?;
-        write_packet(&self.inner, &session, &packet, ErrorPhase::FrameWrite).await
+        let session = require_session(&self.inner)?;
+        send_packet(&self.inner, &session, channel, None, payload).await
     }
 }
 
-fn validate_config(config: &EngineConfig) -> Result<()> {
-    resolve_transport_address(&config.endpoint_name, &config.token)?;
-    let invalid = if config.max_sessions == 0 {
-        Some("max_sessions must be greater than zero")
-    } else if config.supported_encodings.is_empty() {
-        Some("supported_encodings must not be empty")
-    } else if config
-        .supported_encodings
-        .iter()
-        .enumerate()
-        .any(|(index, value)| config.supported_encodings[..index].contains(value))
-    {
-        Some("supported_encodings contains a duplicate")
-    } else if config.supported_capabilities & !IMPLEMENTED_CAPABILITIES != 0 {
-        Some("supported_capabilities enables an unimplemented bit")
-    } else if !config.heartbeat.disabled
-        && (config.heartbeat.interval.is_zero() || config.heartbeat.missed_interval_limit == 0)
-    {
-        Some("enabled heartbeat values must be positive")
-    } else if config.fragmentation.timeout.is_zero()
-        || config.fragmentation.active_sequence_limit == 0
-    {
-        Some("fragmentation values must be positive")
-    } else {
-        None
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.inner) != 1 {
+            return;
+        }
+        if let Some(attempt) = lock(&self.inner.state).attempt.clone() {
+            attempt.cancel();
+        }
+        if let Some(session) = lock(&self.inner.session).take() {
+            session.set_terminal(DisconnectReason::LocalClose, None);
+            stop_accepting(&session);
+            session.request_close();
+            for worker in std::mem::take(&mut *lock(&session.workers)) {
+                worker.abort();
+            }
+        }
+        lock(&self.inner.state).state = EngineState::Idle;
+    }
+}
+
+async fn connect_attempt(
+    inner: &Arc<Inner>,
+    config: &EngineConfig,
+    address: &std::path::Path,
+    attempt: &Arc<Attempt>,
+) -> Result<(ReadHalf<BoxStream>, WriteHalf<BoxStream>, SessionView)> {
+    let dial = tokio::select! {
+        biased;
+        _ = attempt.notify.notified() => return Err(local_close_error()),
+        result = dial_local(address) => result,
     };
-    if let Some(cause) = invalid {
-        return Err(EngineError::new(
-            ErrorCategory::Configuration,
-            StatusCode::ErrProtocolViolation,
-            ErrorPhase::Configuration,
-            cause,
+    let (stream, peer_pid) = dial.map_err(|error| {
+        engine_error(
+            ErrorKind::Dial,
+            format!("local endpoint dial failed: {error}"),
+            StatusCode::ErrPipeFailed,
+            ErrorPhase::Dial,
+            None,
+        )
+    })?;
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut handshake = [0u8; 16];
+    candidate_read(attempt, &mut reader, &mut handshake)
+        .await
+        .map_err(|error| {
+            engine_error(
+                ErrorKind::Handshake,
+                format!("handshake read failed: {error}"),
+                StatusCode::ErrConnectionLost,
+                ErrorPhase::HandshakeRead,
+                None,
+            )
+        })?;
+    let magic = u32::from_be_bytes([handshake[0], handshake[1], handshake[2], handshake[3]]);
+    let version = u32::from_be_bytes([handshake[4], handshake[5], handshake[6], handshake[7]]);
+    let pid = u32::from_be_bytes([handshake[8], handshake[9], handshake[10], handshake[11]]);
+    if magic != MAGIC {
+        return Err(engine_error(
+            ErrorKind::Handshake,
+            "handshake magic is invalid",
+            StatusCode::ErrMagicMismatch,
+            ErrorPhase::HandshakeValidate,
             None,
         ));
     }
-    Ok(())
-}
-
-async fn accept_loop(inner: Arc<Inner>, listener: PlatformListener) {
-    while inner.accepting.load(Ordering::Acquire) {
-        let (stream, peer_pid) = match listener.accept().await {
-            Ok(value) => value,
-            Err(error) => {
-                if inner.accepting.load(Ordering::Acquire) {
-                    emit_endpoint_error(
-                        &inner,
-                        EngineError::new(
-                            ErrorCategory::Endpoint,
-                            StatusCode::ErrPipeFailed,
-                            ErrorPhase::Accept,
-                            format!("accept failed: {error}"),
-                            None,
-                        )
-                        .info,
-                    );
-                }
-                continue;
-            }
-        };
-        let permit = match Arc::clone(&inner.capacity).try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => continue,
-        };
-        let connection_id = inner.next_connection.fetch_add(1, Ordering::Relaxed);
-        let (reader, writer) = tokio::io::split(stream);
-        let connection = Arc::new(Connection {
-            writer: AsyncMutex::new(writer),
-            close: Notify::new(),
-            closing: AtomicBool::new(false),
-        });
-        lock(&inner.connections).insert(connection_id, Arc::clone(&connection));
-        let worker_inner = Arc::clone(&inner);
-        let worker = tokio::spawn(async move {
-            connection_worker(
-                worker_inner,
-                connection_id,
-                connection,
-                reader,
-                peer_pid,
-                permit,
-            )
-            .await;
-        });
-        lock(&inner.workers).push(worker);
-    }
-}
-
-async fn connection_worker(
-    inner: Arc<Inner>,
-    connection_id: u64,
-    connection: Arc<Connection>,
-    mut reader: ReadHalf<BoxStream>,
-    peer_pid: Option<u32>,
-    _permit: OwnedSemaphorePermit,
-) {
-    let session = match establish_session(&inner, &connection, &mut reader, peer_pid).await {
-        Ok(Some(session)) => session,
-        Ok(None) | Err(()) => {
-            connection.request_close();
-            let _ = connection.writer.lock().await.shutdown().await;
-            lock(&inner.connections).remove(&connection_id);
-            return;
-        }
-    };
-    let reason = run_session(&inner, &session, &mut reader).await;
-    *lock(&session.disconnect_reason) = reason;
-    connection.request_close();
-    let _ = connection.writer.lock().await.shutdown().await;
-    lock(&inner.sessions).remove(&session.handle.session_id);
-    lock(&inner.connections).remove(&connection_id);
-    lock(&session.fragments).clear();
-    emit_disconnected(&inner, &session);
-}
-
-async fn establish_session(
-    inner: &Arc<Inner>,
-    connection: &Arc<Connection>,
-    reader: &mut ReadHalf<BoxStream>,
-    peer_pid: Option<u32>,
-) -> std::result::Result<Option<Arc<Session>>, ()> {
-    let mut handshake = [0u8; 16];
-    if let Err(error) = read_exact(connection, reader, &mut handshake).await {
-        if !connection.closing.load(Ordering::Acquire) {
-            emit_endpoint_error(
-                inner,
-                EngineError::new(
-                    ErrorCategory::Handshake,
-                    StatusCode::ErrConnectionLost,
-                    ErrorPhase::HandshakeRead,
-                    format!("handshake read failed: {error}"),
-                    None,
-                )
-                .info,
-            );
-        }
-        return Ok(None);
-    }
-    let magic = u32::from_be_bytes(handshake[0..4].try_into().unwrap());
-    let version = u32::from_be_bytes(handshake[4..8].try_into().unwrap());
-    let pid = u32::from_be_bytes(handshake[8..12].try_into().unwrap());
-    let reject = if magic != MAGIC {
-        Some((StatusCode::ErrMagicMismatch, "handshake magic is invalid"))
-    } else if version != PROTOCOL_VERSION {
-        Some((
+    if version != PROTOCOL_VERSION {
+        return Err(engine_error(
+            ErrorKind::Handshake,
+            "handshake protocol version is incompatible",
             StatusCode::ErrVersionMismatch,
-            "protocol version is incompatible",
-        ))
-    } else if inner.config.expected_pid.is_some_and(|expected| {
+            ErrorPhase::HandshakeValidate,
+            None,
+        ));
+    }
+    if config.expected_go_pid.is_some_and(|expected| {
         expected != pid || peer_pid.is_some_and(|actual| actual != expected)
     }) {
-        Some((
+        return Err(engine_error(
+            ErrorKind::Handshake,
+            "Go PID does not match expected_go_pid",
             StatusCode::ErrPidMismatch,
-            "client PID does not match expected_pid",
-        ))
-    } else {
-        None
-    };
-    if let Some((status, cause)) = reject {
-        emit_endpoint_error(
-            inner,
-            EngineError::new(
-                ErrorCategory::Handshake,
-                status,
-                ErrorPhase::HandshakeValidate,
-                cause,
-                None,
-            )
-            .info,
-        );
-        return Ok(None);
+            ErrorPhase::HandshakeValidate,
+            None,
+        ));
     }
-    let client_encodings = handshake[12];
-    let selected = inner
-        .config
+    let selected = config
         .supported_encodings
         .iter()
         .copied()
-        .find(|encoding| client_encodings & (*encoding as u8) != 0);
-    let Some(selected) = selected else {
-        emit_endpoint_error(
-            inner,
-            EngineError::new(
-                ErrorCategory::Handshake,
+        .find(|encoding| handshake[12] & (*encoding as u8) != 0)
+        .ok_or_else(|| {
+            engine_error(
+                ErrorKind::Encoding,
+                "no common encoding exists",
                 StatusCode::ErrEncodingUnsupported,
                 ErrorPhase::HandshakeValidate,
-                "no supported encoding intersection",
                 None,
             )
-            .info,
-        );
-        return Ok(None);
-    };
-    let client_capabilities = u32::from_be_bytes([0, handshake[13], handshake[14], handshake[15]]);
-    let capabilities =
-        client_capabilities & inner.config.supported_capabilities & IMPLEMENTED_CAPABILITIES;
+        })?;
+    let offered = u32::from_be_bytes([0, handshake[13], handshake[14], handshake[15]]);
+    let capabilities = offered & config.supported_capabilities & IMPLEMENTED_CAPABILITIES;
     let ack = [
         selected as u8,
         ((capabilities >> 16) & 0xff) as u8,
         ((capabilities >> 8) & 0xff) as u8,
         (capabilities & 0xff) as u8,
     ];
-    if write_raw(connection, &ack).await.is_err() {
-        emit_endpoint_error(
-            inner,
-            EngineError::new(
-                ErrorCategory::Transport,
+    candidate_write(attempt, &mut writer, &ack)
+        .await
+        .map_err(|error| {
+            engine_error(
+                ErrorKind::Handshake,
+                format!("ACK write failed: {error}"),
                 StatusCode::ErrWriteFailed,
                 ErrorPhase::AckWrite,
-                "ACK write failed",
                 None,
             )
-            .info,
-        );
-        return Err(());
-    }
-    let epoch = inner.next_epoch.fetch_add(1, Ordering::Relaxed);
+        })?;
+    let epoch = inner.next_epoch.fetch_add(1, Ordering::Relaxed) + 1;
     let session_id = new_session_id(epoch);
-    let handle = SessionHandle {
-        session_id: session_id.clone(),
-        epoch,
-    };
-    let session = Arc::new(Session {
-        connection: Arc::clone(connection),
-        handle: handle.clone(),
-        encoding: selected,
-        capabilities,
-        fragments: Mutex::new(HashMap::new()),
-        last_activity: Mutex::new(Instant::now()),
-        last_heartbeat: Mutex::new(Instant::now()),
-        event_gate: Mutex::new(()),
-        terminal_reported: AtomicBool::new(false),
-        disconnect_reason: Mutex::new(DisconnectReason::PeerClose),
-    });
-    let assignment = build_control_frame(&json!({"type": "session", "session_id": session_id}))
-        .map_err(|_| ())?;
-    if write_raw(connection, &assignment).await.is_err() {
-        emit_endpoint_error(
-            inner,
-            EngineError::new(
-                ErrorCategory::Transport,
+    let assignment = build_control_frame(&json!({"type":"session","session_id":session_id}))
+        .map_err(|failure| {
+            engine_error(
+                ErrorKind::Internal,
+                failure.cause,
+                failure.status,
+                failure.phase,
+                None,
+            )
+        })?;
+    candidate_write(attempt, &mut writer, &assignment)
+        .await
+        .map_err(|error| {
+            engine_error(
+                ErrorKind::Handshake,
+                format!("session assignment write failed: {error}"),
                 StatusCode::ErrWriteFailed,
                 ErrorPhase::SessionWrite,
-                "session assignment write failed",
                 None,
             )
-            .info,
-        );
-        return Err(());
-    }
-    lock(&inner.sessions).insert(handle.session_id.clone(), Arc::clone(&session));
-    emit_connected(inner, &session);
-    Ok(Some(session))
+        })?;
+    Ok((
+        reader,
+        writer,
+        SessionView {
+            session_id,
+            epoch,
+            encoding: selected,
+            capabilities,
+        },
+    ))
 }
 
-async fn run_session(
-    inner: &Arc<Inner>,
-    session: &Arc<Session>,
+async fn candidate_read(
+    attempt: &Attempt,
     reader: &mut ReadHalf<BoxStream>,
-) -> DisconnectReason {
+    buffer: &mut [u8],
+) -> std::io::Result<()> {
+    if attempt.cancelled.load(Ordering::Acquire) {
+        return Err(interrupted());
+    }
+    tokio::select! {
+        biased;
+        _ = attempt.notify.notified() => Err(interrupted()),
+        result = reader.read_exact(buffer) => result.map(|_| ()),
+    }
+}
+
+async fn candidate_write(
+    attempt: &Attempt,
+    writer: &mut WriteHalf<BoxStream>,
+    packet: &[u8],
+) -> std::io::Result<()> {
+    if attempt.cancelled.load(Ordering::Acquire) {
+        return Err(interrupted());
+    }
+    tokio::select! {
+        biased;
+        _ = attempt.notify.notified() => Err(interrupted()),
+        result = writer.write_all(packet) => result,
+    }
+}
+
+fn start_session(inner: &Arc<Inner>, session: &Arc<Session>, reader: ReadHalf<BoxStream>) {
+    let dispatch_inner = Arc::clone(inner);
+    let dispatch_session = Arc::clone(session);
+    let dispatcher =
+        tokio::spawn(async move { dispatch_loop(dispatch_inner, dispatch_session).await });
+    enqueue_application(
+        inner,
+        session,
+        DispatchItem::Connected(session.view.clone(), true),
+    );
+    let reader_inner = Arc::clone(inner);
+    let reader_session = Arc::clone(session);
+    let reader_task =
+        tokio::spawn(async move { read_loop(reader_inner, reader_session, reader).await });
+    let maintenance_inner = Arc::clone(inner);
+    let maintenance_session = Arc::clone(session);
+    let maintenance =
+        tokio::spawn(async move { maintenance_loop(maintenance_inner, maintenance_session).await });
+    *lock(&session.workers) = vec![reader_task, maintenance, dispatcher];
+}
+
+async fn read_loop(inner: Arc<Inner>, session: Arc<Session>, mut reader: ReadHalf<BoxStream>) {
     loop {
         let mut header = [0u8; 6];
-        if let Err(error) = read_exact(&session.connection, reader, &mut header).await {
-            if session.connection.closing.load(Ordering::Acquire) {
-                return *lock(&session.disconnect_reason);
+        if let Err(error) = session_read(&session, &mut reader, &mut header).await {
+            if !session.closing.load(Ordering::Acquire) && !is_peer_close(&error) {
+                session.set_terminal(
+                    DisconnectReason::TransportFailure,
+                    Some(error_info(
+                        ErrorKind::Transport,
+                        format!("frame header read failed: {error}"),
+                        StatusCode::ErrConnectionLost,
+                        ErrorPhase::FrameRead,
+                        Some(session.view.epoch),
+                    )),
+                );
             }
-            if is_peer_close(&error) {
-                return DisconnectReason::PeerClose;
-            }
-            report_terminal(
-                inner,
-                session,
-                ErrorInfo {
-                    category: ErrorCategory::Transport,
-                    status: StatusCode::ErrConnectionLost,
-                    phase: ErrorPhase::FrameRead,
-                    cause: format!("frame header read failed: {error}"),
-                    session: Some(session.handle.clone()),
-                },
-            );
-            return DisconnectReason::TransportFailure;
+            break;
         }
-        let length = u32::from_be_bytes(header[0..4].try_into().unwrap()) as usize;
+        let length = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
         if length > MAX_MESSAGE_SIZE {
             protocol_failure(
-                inner,
-                session,
-                StatusCode::ErrPayloadTooLarge,
-                ErrorPhase::FrameDecode,
-                "frame payload exceeds 16 MiB",
+                &inner,
+                &session,
+                ProtocolFailure::new(
+                    StatusCode::ErrPayloadTooLarge,
+                    ErrorPhase::FrameDecode,
+                    "frame payload exceeds 16 MiB",
+                ),
             )
             .await;
-            return DisconnectReason::ProtocolFailure;
+            break;
         }
         let mut payload = vec![0u8; length];
-        if let Err(error) = read_exact(&session.connection, reader, &mut payload).await {
-            if session.connection.closing.load(Ordering::Acquire) {
-                return *lock(&session.disconnect_reason);
+        if let Err(error) = session_read(&session, &mut reader, &mut payload).await {
+            if !session.closing.load(Ordering::Acquire) {
+                session.set_terminal(
+                    DisconnectReason::TransportFailure,
+                    Some(error_info(
+                        ErrorKind::Transport,
+                        format!("frame payload read failed: {error}"),
+                        StatusCode::ErrConnectionLost,
+                        ErrorPhase::FrameRead,
+                        Some(session.view.epoch),
+                    )),
+                );
             }
-            report_terminal(
-                inner,
-                session,
-                ErrorInfo {
-                    category: ErrorCategory::Transport,
-                    status: StatusCode::ErrConnectionLost,
-                    phase: ErrorPhase::FrameRead,
-                    cause: format!("frame payload read failed: {error}"),
-                    session: Some(session.handle.clone()),
-                },
-            );
-            return DisconnectReason::TransportFailure;
+            break;
         }
-        match process_frame(inner, session, header[4], header[5], &payload).await {
-            Ok(true) => *lock(&session.last_activity) = Instant::now(),
-            Ok(false) => return DisconnectReason::ProtocolFailure,
-            Err(failure) => {
-                protocol_failure(
-                    inner,
-                    session,
-                    failure.status,
-                    failure.phase,
-                    &failure.cause,
-                )
-                .await;
-                return DisconnectReason::ProtocolFailure;
-            }
+        *lock(&session.last_activity) = Instant::now();
+        if let Err(failure) = process_frame(&inner, &session, header[4], header[5], &payload).await
+        {
+            protocol_failure(&inner, &session, failure).await;
+            break;
         }
+        if session.closing.load(Ordering::Acquire) {
+            break;
+        }
+    }
+    finalize_session(&inner, &session).await;
+}
+
+async fn session_read(
+    session: &Session,
+    reader: &mut ReadHalf<BoxStream>,
+    buffer: &mut [u8],
+) -> std::io::Result<()> {
+    if session.closing.load(Ordering::Acquire) {
+        return Err(interrupted());
+    }
+    tokio::select! {
+        biased;
+        _ = session.close.notified() => Err(interrupted()),
+        result = reader.read_exact(buffer) => result.map(|_| ()),
     }
 }
 
@@ -623,7 +666,7 @@ async fn process_frame(
     raw_channel: u8,
     flags: u8,
     payload: &[u8],
-) -> std::result::Result<bool, ProtocolFailure> {
+) -> std::result::Result<(), ProtocolFailure> {
     let channel = Channel::try_from(raw_channel).map_err(|_| {
         ProtocolFailure::new(
             StatusCode::ErrProtocolViolation,
@@ -642,7 +685,7 @@ async fn process_frame(
         return Err(ProtocolFailure::new(
             StatusCode::ErrProtocolViolation,
             ErrorPhase::FrameDecode,
-            "Log is not valid client-to-engine traffic",
+            "Log is not valid Go-to-engine traffic",
         ));
     }
     if channel == Channel::Control {
@@ -657,7 +700,7 @@ async fn process_frame(
     }
     let fragmented = flags & FLAG_FRAGMENT != 0;
     let correlated = flags & FLAG_CORRELATED != 0;
-    if correlated && session.capabilities & CAP_CORRELATION == 0 {
+    if correlated && session.view.capabilities & CAP_CORRELATION == 0 {
         return Err(ProtocolFailure::new(
             StatusCode::ErrProtocolViolation,
             ErrorPhase::FrameDecode,
@@ -674,7 +717,9 @@ async fn process_frame(
             ));
         }
         offset = 4;
-        Some(u32::from_be_bytes(payload[0..4].try_into().unwrap()))
+        Some(u32::from_be_bytes([
+            payload[0], payload[1], payload[2], payload[3],
+        ]))
     } else {
         None
     };
@@ -686,22 +731,27 @@ async fn process_frame(
                 "correlation prefix is shorter than four bytes",
             ));
         }
-        let value = u32::from_be_bytes(payload[offset..offset + 4].try_into().unwrap());
+        let id = u32::from_be_bytes([
+            payload[offset],
+            payload[offset + 1],
+            payload[offset + 2],
+            payload[offset + 3],
+        ]);
         offset += 4;
-        Some(value)
+        Some(id)
     } else {
         None
     };
-    if fragmented {
+    if let Some(fragment_id) = fragment_id {
         process_fragment(
             inner,
             session,
             channel,
             flags,
-            fragment_id.unwrap(),
+            fragment_id,
             correlation_id,
             &payload[offset..],
-        )?;
+        )
     } else {
         if lock(&session.fragments).contains_key(&channel) {
             return Err(ProtocolFailure::new(
@@ -710,19 +760,10 @@ async fn process_frame(
                 "fragment sequences cannot be interleaved on one channel",
             ));
         }
-        let decoded = decode_payload(&payload[offset..], session.encoding)?;
-        emit_message(
-            inner,
-            session,
-            MessageEvent {
-                session: session.handle.clone(),
-                channel,
-                payload: decoded,
-                correlation_id,
-            },
-        );
+        let value = decode_payload(&payload[offset..], session.view.encoding)?;
+        deliver_message(inner, session, channel, value, correlation_id);
+        Ok(())
     }
-    Ok(true)
 }
 
 fn process_fragment(
@@ -737,7 +778,7 @@ fn process_fragment(
     let complete = {
         let mut fragments = lock(&session.fragments);
         if !fragments.contains_key(&channel) {
-            if fragments.len() >= inner.config.fragmentation.active_sequence_limit {
+            if fragments.len() >= session.config.fragmentation.active_sequence_limit {
                 return Err(ProtocolFailure::new(
                     StatusCode::ErrProtocolViolation,
                     ErrorPhase::Fragmentation,
@@ -750,11 +791,17 @@ fn process_fragment(
                     id: fragment_id,
                     correlation_id,
                     data: Vec::new(),
-                    deadline: Instant::now() + inner.config.fragmentation.timeout,
+                    deadline: Instant::now() + session.config.fragmentation.timeout,
                 },
             );
         }
-        let fragment = fragments.get_mut(&channel).unwrap();
+        let Some(fragment) = fragments.get_mut(&channel) else {
+            return Err(ProtocolFailure::new(
+                StatusCode::ErrInternal,
+                ErrorPhase::Fragmentation,
+                "fragment state could not be created",
+            ));
+        };
         if fragment.id != fragment_id || fragment.correlation_id != correlation_id {
             fragments.remove(&channel);
             return Err(ProtocolFailure::new(
@@ -773,45 +820,93 @@ fn process_fragment(
         }
         fragment.data.extend_from_slice(data);
         if flags & FLAG_LAST_FRAGMENT != 0 {
-            Some(fragments.remove(&channel).unwrap().data)
+            fragments.remove(&channel).map(|fragment| fragment.data)
         } else {
             None
         }
     };
     if let Some(data) = complete {
-        let decoded = decode_payload(&data, session.encoding)?;
-        emit_message(
-            inner,
-            session,
-            MessageEvent {
-                session: session.handle.clone(),
-                channel,
-                payload: decoded,
-                correlation_id,
-            },
-        );
+        let value = decode_payload(&data, session.view.encoding)?;
+        deliver_message(inner, session, channel, value, correlation_id);
     }
     Ok(())
+}
+
+fn deliver_message(
+    inner: &Arc<Inner>,
+    session: &Arc<Session>,
+    channel: Channel,
+    payload: Value,
+    correlation_id: Option<u32>,
+) {
+    let responder = correlation_id.map(|correlation_id| Responder {
+        inner: Arc::new(ResponderInner {
+            engine: Arc::downgrade(inner),
+            epoch: session.view.epoch,
+            correlation_id,
+            used: AtomicBool::new(false),
+        }),
+    });
+    enqueue_application(
+        inner,
+        session,
+        DispatchItem::Message(
+            MessageEvent {
+                session: session.view.clone(),
+                channel,
+                payload,
+                correlation_id,
+                responder,
+            },
+            true,
+        ),
+    );
 }
 
 async fn process_control(
     inner: &Arc<Inner>,
     session: &Arc<Session>,
     payload: &[u8],
-) -> std::result::Result<bool, ProtocolFailure> {
+) -> std::result::Result<(), ProtocolFailure> {
     let control = decode_control(payload)?;
-    match control.get("type").and_then(Value::as_str).unwrap() {
+    match control
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "heartbeat" => {
+            let timestamp = control
+                .get("ts")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(now_millis);
+            enqueue_application(
+                inner,
+                session,
+                DispatchItem::Heartbeat(
+                    HeartbeatEvent {
+                        session: session.view.clone(),
+                        timestamp,
+                    },
+                    true,
+                ),
+            );
+        }
         "ping" => {
-            let frame = build_control_frame(&json!({"type": "pong",
-                "seq": control.get("seq").cloned().unwrap_or(Value::Null)}))?;
-            write_packet(inner, session, &frame, ErrorPhase::FrameWrite)
+            let packet = build_control_frame(&json!({
+                "type":"pong","seq":control.get("seq").cloned().unwrap_or(Value::Null)
+            }))?;
+            write_packet(inner, session, &packet, ErrorPhase::FrameWrite)
                 .await
                 .map_err(|error| {
-                    ProtocolFailure::new(error.code(), ErrorPhase::FrameWrite, error.info.cause)
+                    ProtocolFailure::new(
+                        error.code().unwrap_or(StatusCode::ErrWriteFailed),
+                        ErrorPhase::FrameWrite,
+                        error.info.cause,
+                    )
                 })?;
         }
         "error" => {
-            let code = control
+            let status = control
                 .get("code")
                 .and_then(Value::as_u64)
                 .and_then(|value| u16::try_from(value).ok())
@@ -826,129 +921,190 @@ async fn process_control(
             let cause = control
                 .get("message")
                 .and_then(Value::as_str)
-                .unwrap_or("peer reported a protocol error");
-            report_terminal(
-                inner,
-                session,
-                ErrorInfo {
-                    category: ErrorCategory::Protocol,
-                    status: code,
-                    phase: ErrorPhase::FrameDecode,
-                    cause: cause.to_owned(),
-                    session: Some(session.handle.clone()),
-                },
+                .unwrap_or("Go peer reported a protocol error")
+                .to_owned();
+            session.set_terminal(
+                DisconnectReason::ProtocolFailure,
+                Some(error_info(
+                    ErrorKind::Protocol,
+                    cause,
+                    status,
+                    ErrorPhase::FrameDecode,
+                    Some(session.view.epoch),
+                )),
             );
-            *lock(&session.disconnect_reason) = DisconnectReason::ProtocolFailure;
-            session.connection.request_close();
-            return Ok(false);
+            stop_accepting(session);
+            session.request_close();
         }
         _ => {}
     }
-    Ok(true)
+    Ok(())
 }
 
-async fn maintenance_loop(inner: Arc<Inner>) {
-    let mut ticker = tokio::time::interval(Duration::from_millis(25));
+async fn maintenance_loop(inner: Arc<Inner>, session: Arc<Session>) {
+    let period = Duration::from_millis(25)
+        .min(session.config.fragmentation.timeout)
+        .min(if session.config.heartbeat.disabled {
+            Duration::from_millis(25)
+        } else {
+            session.config.heartbeat.interval
+        })
+        .max(Duration::from_millis(1));
+    let mut ticker = tokio::time::interval(period);
     loop {
-        ticker.tick().await;
-        if !inner.accepting.load(Ordering::Acquire) {
+        tokio::select! {
+            biased;
+            _ = session.close.notified() => return,
+            _ = ticker.tick() => {}
+        }
+        if session.closing.load(Ordering::Acquire) {
             return;
         }
-        let sessions: Vec<_> = lock(&inner.sessions).values().cloned().collect();
         let now = Instant::now();
-        for session in sessions {
-            if session.connection.closing.load(Ordering::Acquire) {
-                continue;
-            }
-            let expired = {
-                let mut fragments = lock(&session.fragments);
-                let before = fragments.len();
-                fragments.retain(|_, fragment| fragment.deadline > now);
-                before - fragments.len()
+        let expired = {
+            let mut fragments = lock(&session.fragments);
+            let before = fragments.len();
+            fragments.retain(|_, fragment| fragment.deadline > now);
+            before - fragments.len()
+        };
+        for _ in 0..expired {
+            enqueue_application(
+                &inner,
+                &session,
+                DispatchItem::Error(
+                    error_info(
+                        ErrorKind::Timeout,
+                        "incomplete fragment sequence expired",
+                        StatusCode::ErrFragmentTimeout,
+                        ErrorPhase::Fragmentation,
+                        Some(session.view.epoch),
+                    ),
+                    true,
+                ),
+            );
+        }
+        if session.config.heartbeat.disabled {
+            continue;
+        }
+        let deadline = session
+            .config
+            .heartbeat
+            .interval
+            .saturating_mul(session.config.heartbeat.missed_interval_limit);
+        if now.duration_since(*lock(&session.last_activity)) >= deadline {
+            session.set_terminal(
+                DisconnectReason::HeartbeatTimeout,
+                Some(error_info(
+                    ErrorKind::Timeout,
+                    "session heartbeat deadline expired",
+                    StatusCode::ErrReadTimeout,
+                    ErrorPhase::Heartbeat,
+                    Some(session.view.epoch),
+                )),
+            );
+            stop_accepting(&session);
+            session.request_close();
+            return;
+        }
+        if now.duration_since(*lock(&session.last_heartbeat)) >= session.config.heartbeat.interval {
+            let packet = match build_control_frame(&json!({
+                "type":"heartbeat","ts":now_millis()
+            })) {
+                Ok(value) => value,
+                Err(_) => continue,
             };
-            for _ in 0..expired {
-                emit_session_error(
-                    &inner,
-                    &session,
-                    ErrorInfo {
-                        category: ErrorCategory::Protocol,
-                        status: StatusCode::ErrFragmentTimeout,
-                        phase: ErrorPhase::Fragmentation,
-                        cause: "incomplete fragment sequence expired".to_owned(),
-                        session: Some(session.handle.clone()),
-                    },
-                );
-            }
-            if inner.config.heartbeat.disabled {
-                continue;
-            }
-            let deadline = inner
-                .config
-                .heartbeat
-                .interval
-                .saturating_mul(inner.config.heartbeat.missed_interval_limit);
-            if now.duration_since(*lock(&session.last_activity)) >= deadline {
-                report_terminal(
-                    &inner,
-                    &session,
-                    ErrorInfo {
-                        category: ErrorCategory::Transport,
-                        status: StatusCode::ErrReadTimeout,
-                        phase: ErrorPhase::Heartbeat,
-                        cause: "session heartbeat deadline expired".to_owned(),
-                        session: Some(session.handle.clone()),
-                    },
-                );
-                *lock(&session.disconnect_reason) = DisconnectReason::HeartbeatTimeout;
-                session.connection.request_close();
-            } else if now.duration_since(*lock(&session.last_heartbeat))
-                >= inner.config.heartbeat.interval
+            if write_packet(&inner, &session, &packet, ErrorPhase::Heartbeat)
+                .await
+                .is_err()
             {
-                let timestamp = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis()
-                    .min(u128::from(u64::MAX)) as u64;
-                if let Ok(frame) =
-                    build_control_frame(&json!({"type": "heartbeat", "ts": timestamp}))
-                {
-                    if write_packet(&inner, &session, &frame, ErrorPhase::Heartbeat)
-                        .await
-                        .is_ok()
-                    {
-                        *lock(&session.last_heartbeat) = now;
-                    }
-                }
+                return;
             }
+            *lock(&session.last_heartbeat) = now;
         }
     }
 }
 
-async fn protocol_failure(
+async fn protocol_failure(_inner: &Arc<Inner>, session: &Arc<Session>, failure: ProtocolFailure) {
+    session.set_terminal(
+        DisconnectReason::ProtocolFailure,
+        Some(error_info(
+            ErrorKind::Protocol,
+            failure.cause.clone(),
+            failure.status,
+            failure.phase,
+            Some(session.view.epoch),
+        )),
+    );
+    stop_accepting(session);
+    if let Ok(packet) = build_control_frame(&json!({
+        "type":"error","code":failure.status as u16,"message":failure.cause
+    })) {
+        let _ = write_raw(session, &packet).await;
+    }
+    session.request_close();
+}
+
+async fn respond_inner<T: Serialize + ?Sized>(
+    inner: &Arc<Inner>,
+    epoch: u64,
+    correlation_id: u32,
+    payload: &T,
+) -> Result<()> {
+    let session = require_epoch(inner, epoch)?;
+    if session.view.capabilities & CAP_CORRELATION == 0 {
+        return Err(engine_error(
+            ErrorKind::Capability,
+            "correlation was not negotiated",
+            StatusCode::ErrProtocolViolation,
+            ErrorPhase::ApplicationSend,
+            Some(epoch),
+        ));
+    }
+    send_packet(
+        inner,
+        &session,
+        Channel::Data,
+        Some(correlation_id),
+        payload,
+    )
+    .await
+}
+
+async fn send_packet<T: Serialize + ?Sized>(
     inner: &Arc<Inner>,
     session: &Arc<Session>,
-    status: StatusCode,
-    phase: ErrorPhase,
-    cause: &str,
-) {
-    report_terminal(
-        inner,
-        session,
-        ErrorInfo {
-            category: ErrorCategory::Protocol,
-            status,
-            phase,
-            cause: cause.to_owned(),
-            session: Some(session.handle.clone()),
-        },
-    );
-    if let Ok(frame) =
-        build_control_frame(&json!({"type": "error", "code": status as u16, "message": cause}))
-    {
-        let _ = write_raw(&session.connection, &frame).await;
+    channel: Channel,
+    correlation_id: Option<u32>,
+    payload: &T,
+) -> Result<()> {
+    let encoded = encode_payload(payload, session.view.encoding)
+        .map_err(|failure| serialization_error(failure, session.view.epoch))?;
+    let prefix_size = usize::from(correlation_id.is_some()) * 4;
+    if encoded.len() > MAX_MESSAGE_SIZE - prefix_size {
+        return Err(engine_error(
+            ErrorKind::Protocol,
+            "encoded frame exceeds 16 MiB",
+            StatusCode::ErrPayloadTooLarge,
+            ErrorPhase::ApplicationSend,
+            Some(session.view.epoch),
+        ));
     }
-    *lock(&session.disconnect_reason) = DisconnectReason::ProtocolFailure;
-    session.connection.request_close();
+    let mut framed = Vec::with_capacity(prefix_size + encoded.len());
+    if let Some(correlation_id) = correlation_id {
+        framed.extend_from_slice(&correlation_id.to_be_bytes());
+    }
+    framed.extend_from_slice(&encoded);
+    let packet = build_frame(
+        channel,
+        if correlation_id.is_some() {
+            FLAG_CORRELATED
+        } else {
+            0
+        },
+        &framed,
+    )
+    .map_err(|failure| serialization_error(failure, session.view.epoch))?;
+    write_packet(inner, session, &packet, ErrorPhase::FrameWrite).await
 }
 
 async fn write_packet(
@@ -957,101 +1113,388 @@ async fn write_packet(
     packet: &[u8],
     phase: ErrorPhase,
 ) -> Result<()> {
-    if session.connection.closing.load(Ordering::Acquire) {
-        return Err(EngineError::new(
-            ErrorCategory::Session,
-            StatusCode::ErrConnectionLost,
-            phase,
-            "session is closing",
-            Some(session.handle.clone()),
-        ));
+    require_epoch(inner, session.view.epoch)?;
+    if session.closing.load(Ordering::Acquire) {
+        return Err(stale_error(session.view.epoch));
     }
-    if let Err(error) = write_raw(&session.connection, packet).await {
-        let failure = EngineError::new(
-            ErrorCategory::Transport,
+    if let Err(error) = write_raw(session, packet).await {
+        let failure = error_info(
+            ErrorKind::Transport,
+            format!("transport write failed: {error}"),
             StatusCode::ErrWriteFailed,
             phase,
-            format!("transport write failed: {error}"),
-            Some(session.handle.clone()),
+            Some(session.view.epoch),
         );
-        report_terminal(inner, session, failure.info.clone());
-        *lock(&session.disconnect_reason) = DisconnectReason::TransportFailure;
-        session.connection.request_close();
-        return Err(failure);
+        session.set_terminal(DisconnectReason::TransportFailure, Some(failure.clone()));
+        stop_accepting(session);
+        session.request_close();
+        return Err(EngineError { info: failure });
     }
     Ok(())
 }
 
-async fn write_raw(connection: &Connection, packet: &[u8]) -> std::io::Result<()> {
-    connection.writer.lock().await.write_all(packet).await
+async fn write_raw(session: &Session, packet: &[u8]) -> std::io::Result<()> {
+    let mut writer = session.writer.lock().await;
+    if session.closing.load(Ordering::Acquire) {
+        return Err(interrupted());
+    }
+    writer.write_all(packet).await
 }
 
-async fn read_exact(
-    connection: &Connection,
-    reader: &mut ReadHalf<BoxStream>,
-    buffer: &mut [u8],
-) -> std::io::Result<()> {
-    tokio::select! {
-        biased;
-        _ = connection.close.notified() => Err(std::io::Error::new(
-            std::io::ErrorKind::Interrupted, "connection closing")),
-        result = reader.read_exact(buffer) => result.map(|_| ()),
+fn require_session(inner: &Arc<Inner>) -> Result<Arc<Session>> {
+    let session = lock(&inner.session).clone();
+    match session {
+        Some(session)
+            if lock(&inner.state).state == EngineState::Connected
+                && !session.closing.load(Ordering::Acquire) =>
+        {
+            Ok(session)
+        }
+        Some(session) => Err(stale_error(session.view.epoch)),
+        None => Err(engine_error(
+            ErrorKind::SessionClosed,
+            "engine has no live session",
+            StatusCode::ErrConnectionLost,
+            ErrorPhase::ApplicationSend,
+            None,
+        )),
     }
 }
 
-fn report_terminal(inner: &Arc<Inner>, session: &Arc<Session>, failure: ErrorInfo) {
-    if !session.terminal_reported.swap(true, Ordering::AcqRel) {
-        emit_session_error(inner, session, failure);
+fn require_epoch(inner: &Arc<Inner>, epoch: u64) -> Result<Arc<Session>> {
+    let session = lock(&inner.session).clone();
+    match session {
+        Some(session)
+            if session.view.epoch == epoch
+                && lock(&inner.state).state == EngineState::Connected
+                && !session.closing.load(Ordering::Acquire) =>
+        {
+            Ok(session)
+        }
+        _ => Err(stale_error(epoch)),
     }
 }
 
-fn emit_connected(inner: &Arc<Inner>, session: &Arc<Session>) {
-    let _gate = lock(&session.event_gate);
-    if let Some(callback) = read_lock(&inner.callbacks).connected.clone() {
-        callback(SessionView {
-            handle: session.handle.clone(),
-            encoding: session.encoding,
-            capabilities: session.capabilities,
-        });
+fn enqueue_application(inner: &Arc<Inner>, session: &Arc<Session>, item: DispatchItem) -> bool {
+    let mut dispatch = lock(&session.dispatch.state);
+    if !dispatch.accepting || dispatch.finalized {
+        return false;
+    }
+    if item.uses_capacity() && dispatch.capacity_used >= session.dispatch.capacity {
+        dispatch.accepting = false;
+        drop(dispatch);
+        session.set_terminal(
+            DisconnectReason::Backpressure,
+            Some(error_info(
+                ErrorKind::Backpressure,
+                "application queue capacity exhausted",
+                StatusCode::ErrInternal,
+                ErrorPhase::ApplicationDispatch,
+                Some(session.view.epoch),
+            )),
+        );
+        session.request_close();
+        let _ = inner;
+        return false;
+    }
+    if item.uses_capacity() {
+        dispatch.capacity_used += 1;
+    }
+    dispatch.items.push_back(item);
+    drop(dispatch);
+    session.dispatch.notify.notify_one();
+    true
+}
+
+fn enqueue_terminal(session: &Session, item: DispatchItem) {
+    lock(&session.dispatch.state).items.push_back(item);
+    session.dispatch.notify.notify_one();
+}
+
+async fn dispatch_loop(inner: Arc<Inner>, session: Arc<Session>) {
+    loop {
+        let item = loop {
+            let next = {
+                let mut dispatch = lock(&session.dispatch.state);
+                if let Some(item) = dispatch.items.pop_front() {
+                    Some(Ok(item))
+                } else if dispatch.finalized {
+                    Some(Err(()))
+                } else {
+                    None
+                }
+            };
+            match next {
+                Some(Ok(item)) => break item,
+                Some(Err(())) => return,
+                None => session.dispatch.notify.notified().await,
+            }
+        };
+        let uses_capacity = item.uses_capacity();
+        let callback = {
+            let callbacks = read_lock(&inner.callbacks);
+            match &item {
+                DispatchItem::Connected(_, _) => {
+                    callbacks.connected.clone().map(Callback::Connected)
+                }
+                DispatchItem::Message(_, _) => callbacks.message.clone().map(Callback::Message),
+                DispatchItem::Heartbeat(_, _) => {
+                    callbacks.heartbeat.clone().map(Callback::Heartbeat)
+                }
+                DispatchItem::Error(_, _) => callbacks.error.clone().map(Callback::Error),
+                DispatchItem::Disconnected(_) => {
+                    callbacks.disconnected.clone().map(Callback::Disconnected)
+                }
+            }
+        };
+        if let Some(callback) = callback {
+            let terminal_observer = matches!(
+                item,
+                DispatchItem::Error(_, _) | DispatchItem::Disconnected(_)
+            );
+            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| callback.invoke(&item))) {
+                if terminal_observer {
+                    eprintln!(
+                        "Yuumi application observer panicked: {}",
+                        panic_message(payload)
+                    );
+                } else {
+                    enqueue_terminal(
+                        &session,
+                        DispatchItem::Error(
+                            error_info(
+                                ErrorKind::Application,
+                                "application callback panicked",
+                                StatusCode::ErrInternal,
+                                ErrorPhase::ApplicationDispatch,
+                                Some(session.view.epoch),
+                            ),
+                            false,
+                        ),
+                    );
+                }
+            }
+        }
+        if uses_capacity {
+            let mut dispatch = lock(&session.dispatch.state);
+            dispatch.capacity_used = dispatch.capacity_used.saturating_sub(1);
+        }
     }
 }
 
-fn emit_message(inner: &Arc<Inner>, session: &Arc<Session>, event: MessageEvent) {
-    let _gate = lock(&session.event_gate);
-    if let Some(callback) = read_lock(&inner.callbacks).message.clone() {
-        callback(event);
+enum Callback {
+    Connected(ConnectedCallback),
+    Message(MessageCallback),
+    Heartbeat(HeartbeatCallback),
+    Error(ErrorCallback),
+    Disconnected(DisconnectedCallback),
+}
+
+impl Callback {
+    fn invoke(&self, item: &DispatchItem) {
+        match (self, item) {
+            (Self::Connected(callback), DispatchItem::Connected(value, _)) => {
+                callback(value.clone())
+            }
+            (Self::Message(callback), DispatchItem::Message(value, _)) => callback(value.clone()),
+            (Self::Heartbeat(callback), DispatchItem::Heartbeat(value, _)) => {
+                callback(value.clone())
+            }
+            (Self::Error(callback), DispatchItem::Error(value, _)) => callback(value.clone()),
+            (Self::Disconnected(callback), DispatchItem::Disconnected(value)) => {
+                callback(value.clone())
+            }
+            _ => {}
+        }
     }
 }
 
-fn emit_session_error(inner: &Arc<Inner>, session: &Arc<Session>, failure: ErrorInfo) {
-    let _gate = lock(&session.event_gate);
+async fn finalize_session(inner: &Arc<Inner>, session: &Arc<Session>) {
+    if session.finalized.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    stop_accepting(session);
+    session.request_close();
+    let _ = session.writer.lock().await.shutdown().await;
+    lock(&session.fragments).clear();
+    let terminal = lock(&session.terminal).clone().unwrap_or(TerminalResult {
+        reason: DisconnectReason::PeerClose,
+        error: None,
+    });
+    {
+        let mut current = lock(&inner.session);
+        if current
+            .as_ref()
+            .is_some_and(|value| Arc::ptr_eq(value, session))
+        {
+            *current = None;
+        }
+    }
+    *lock(&inner.terminal_result) = Some(terminal.clone());
+    lock(&inner.state).state = EngineState::Idle;
+    if let Some(error) = terminal.error.clone() {
+        enqueue_terminal(session, DispatchItem::Error(error, false));
+    }
+    enqueue_terminal(
+        session,
+        DispatchItem::Disconnected(DisconnectEvent {
+            session: session.view.clone(),
+            terminal,
+        }),
+    );
+    lock(&session.dispatch.state).finalized = true;
+    session.dispatch.notify.notify_waiters();
+}
+
+async fn join_workers(session: &Arc<Session>) -> Result<()> {
+    let workers = std::mem::take(&mut *lock(&session.workers));
+    for mut worker in workers {
+        if tokio::time::timeout(Duration::from_secs(2), &mut worker)
+            .await
+            .is_err()
+        {
+            worker.abort();
+            return Err(engine_error(
+                ErrorKind::Timeout,
+                "worker did not stop before close deadline",
+                StatusCode::ErrReadTimeout,
+                ErrorPhase::Close,
+                Some(session.view.epoch),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn stop_accepting(session: &Session) {
+    lock(&session.dispatch.state).accepting = false;
+}
+
+fn validate_config(config: &EngineConfig) -> Result<()> {
+    resolve_transport_address(&config.endpoint_name, &config.token)?;
+    let cause = if config.supported_encodings.is_empty() {
+        Some("supported_encodings must not be empty")
+    } else if config
+        .supported_encodings
+        .iter()
+        .enumerate()
+        .any(|(index, value)| config.supported_encodings[..index].contains(value))
+    {
+        Some("supported_encodings contains a duplicate")
+    } else if config.supported_capabilities & !IMPLEMENTED_CAPABILITIES != 0 {
+        Some("supported_capabilities enables an unimplemented bit")
+    } else if config.connect_timeout.is_zero() {
+        Some("connect_timeout must be positive")
+    } else if config.application_queue_capacity == 0 {
+        Some("application_queue_capacity must be a positive integer")
+    } else if !config.heartbeat.disabled
+        && (config.heartbeat.interval.is_zero() || config.heartbeat.missed_interval_limit == 0)
+    {
+        Some("enabled heartbeat values must be positive")
+    } else if config.fragmentation.timeout.is_zero()
+        || config.fragmentation.active_sequence_limit == 0
+    {
+        Some("fragmentation values must be positive")
+    } else {
+        None
+    };
+    match cause {
+        Some(cause) => Err(engine_error(
+            ErrorKind::Configuration,
+            cause,
+            StatusCode::ErrProtocolViolation,
+            ErrorPhase::Configuration,
+            None,
+        )),
+        None => Ok(()),
+    }
+}
+
+fn emit_pre_session_error(inner: &Arc<Inner>, error: ErrorInfo) {
     if let Some(callback) = read_lock(&inner.callbacks).error.clone() {
-        callback(failure);
+        if catch_unwind(AssertUnwindSafe(|| callback(error))).is_err() {
+            eprintln!("Yuumi pre-session error observer panicked");
+        }
     }
 }
 
-fn emit_endpoint_error(inner: &Arc<Inner>, failure: ErrorInfo) {
-    if let Some(callback) = read_lock(&inner.callbacks).error.clone() {
-        callback(failure);
+fn engine_error(
+    kind: ErrorKind,
+    cause: impl Into<String>,
+    status: StatusCode,
+    phase: ErrorPhase,
+    epoch: Option<u64>,
+) -> EngineError {
+    EngineError::new(kind, cause, Some(status), Some(phase), epoch)
+}
+
+fn error_info(
+    kind: ErrorKind,
+    cause: impl Into<String>,
+    status: StatusCode,
+    phase: ErrorPhase,
+    epoch: Option<u64>,
+) -> ErrorInfo {
+    ErrorInfo {
+        kind,
+        cause: cause.into(),
+        status: Some(status),
+        phase: Some(phase),
+        epoch,
     }
 }
 
-fn emit_disconnected(inner: &Arc<Inner>, session: &Arc<Session>) {
-    let _gate = lock(&session.event_gate);
-    if let Some(callback) = read_lock(&inner.callbacks).disconnected.clone() {
-        callback(DisconnectEvent {
-            session: session.handle.clone(),
-            reason: *lock(&session.disconnect_reason),
-        });
-    }
+fn state_error(cause: &str) -> EngineError {
+    engine_error(
+        ErrorKind::State,
+        cause,
+        StatusCode::ErrProtocolViolation,
+        ErrorPhase::Dial,
+        None,
+    )
+}
+
+fn local_close_error() -> EngineError {
+    engine_error(
+        ErrorKind::SessionClosed,
+        "connection attempt was closed locally",
+        StatusCode::ErrConnectionLost,
+        ErrorPhase::Close,
+        None,
+    )
+}
+
+fn stale_error(epoch: u64) -> EngineError {
+    engine_error(
+        ErrorKind::StaleEpoch,
+        "operation belongs to an earlier or closed epoch",
+        StatusCode::ErrConnectionLost,
+        ErrorPhase::ApplicationSend,
+        Some(epoch),
+    )
+}
+
+fn interrupted() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "connection closing")
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 fn new_session_id(epoch: u64) -> String {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("rs-{:x}-{epoch:x}-{timestamp:x}", std::process::id())
+    format!(
+        "rs-{:x}-{epoch:x}-{:x}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
 }
 
 fn is_peer_close(error: &std::io::Error) -> bool {
@@ -1061,6 +1504,15 @@ fn is_peer_close(error: &std::io::Error) -> bool {
             | std::io::ErrorKind::BrokenPipe
             | std::io::ErrorKind::ConnectionReset
     )
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
+        .to_owned()
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1080,8 +1532,9 @@ fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 }
 
 /*
-Callbacks execute synchronously on the Tokio task that produced the event.
-Events are serialized per session; different sessions may invoke callbacks
-concurrently. Same-session writes are serialized by the connection write lock.
-Sequential awaited sends preserve order; concurrent sends follow lock acquisition.
+The reader, heartbeat worker and serial application dispatcher are independent
+Tokio tasks. The bounded queue counts queued and currently executing
+application callbacks, while terminal error and disconnected events bypass the
+capacity so backpressure remains observable. Every task and responder captures
+the local epoch; a replacement session cannot be addressed by stale work.
 */

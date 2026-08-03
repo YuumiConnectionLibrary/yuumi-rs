@@ -1,7 +1,7 @@
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::types::{Channel, Encoding, ErrorCategory, ErrorPhase, StatusCode, MAX_MESSAGE_SIZE};
+use crate::types::{Channel, Encoding, ErrorPhase, StatusCode, MAX_MESSAGE_SIZE};
 
 pub(crate) const FLAG_FRAGMENT: u8 = 0x01;
 pub(crate) const FLAG_LAST_FRAGMENT: u8 = 0x02;
@@ -120,13 +120,13 @@ pub(crate) fn build_control_frame<T: Serialize + ?Sized>(
 
 pub(crate) fn serialization_error(
     failure: ProtocolFailure,
-    session: crate::types::SessionHandle,
+    epoch: u64,
 ) -> crate::types::EngineError {
     crate::types::EngineError::new(
-        ErrorCategory::Serialization,
-        failure.status,
-        failure.phase,
+        crate::types::ErrorKind::Encoding,
         failure.cause,
-        Some(session),
+        Some(failure.status),
+        Some(failure.phase),
+        Some(epoch),
     )
 }

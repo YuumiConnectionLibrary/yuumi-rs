@@ -2,21 +2,19 @@
 
 Rust Engine SDK for Yuumi Wire Protocol version 1.
 
-`yuumi-rs` opens a local endpoint and accepts sessions from the Go shell. It is
-not a client SDK and does not expose an outbound dialer, reconnect policy,
-process launcher, restart policy, or application semantics.
+The Go application is the only client and owns the local listener. A Rust
+engine derives the canonical address and performs one explicit outbound
+connection. The crate exposes no listener, client, Runner, process launcher,
+automatic reconnection policy, or application payload schema.
 
-## Platform transport
+## Requirements
 
-| Platform | Transport | Endpoint security |
-|---|---|---|
-| Linux | Unix domain stream socket | Owner-only mode `0600` |
-| macOS | Unix domain stream socket | Owner-only mode `0600` |
-| Windows | Named Pipe byte stream | Current-user ACL and remote-client rejection |
+- stable Rust with edition 2021 support;
+- Linux, macOS, or Windows;
+- Tokio, Serde, `serde_json`, and `rmp-serde`.
 
-The address is derived from `endpoint_name` and the 32-character lowercase
-hexadecimal `token`. Full transport paths cannot be supplied through the public
-Engine API.
+Windows uses a byte-stream Named Pipe. Linux and macOS use a Unix domain stream
+socket. There is no TCP or transport fallback.
 
 ## Engine example
 
@@ -35,83 +33,112 @@ async fn main() -> Result<()> {
     let engine = Engine::new(config);
 
     engine.on_session_connected(Arc::new(|session| {
-        println!("session connected: {}", session.handle.session_id);
+        println!("connected: {} epoch={}", session.session_id, session.epoch);
     }));
 
-    let responder = engine.clone();
-    engine.on_message(Arc::new(move |event: MessageEvent| {
-        let responder = responder.clone();
-        tokio::spawn(async move {
-            let result = match event.correlation_id {
-                Some(id) => responder
-                    .send_correlated(&event.session, Channel::Data, id, &json!({"ok": true}))
-                    .await,
-                None => responder
-                    .send(&event.session, Channel::Data, &json!({"ok": true}))
-                    .await,
-            };
-            if let Err(error) = result {
-                eprintln!("send failed: {error}");
-            }
-        });
+    engine.on_message(Arc::new(|event: MessageEvent| {
+        if let Some(responder) = event.responder {
+            tokio::spawn(async move {
+                if let Err(error) = responder.respond(&json!({"ok": true})).await {
+                    eprintln!("response failed: {error}");
+                }
+            });
+        }
     }));
 
     engine.on_error(Arc::new(|error| {
-        eprintln!("engine error {}: {}", error.status as u16, error.cause);
+        eprintln!("{:?}: {}", error.kind, error.cause);
     }));
 
-    engine.open().await?;
-    application_shutdown().await;
+    engine.connect().await?;
+    run_application_loop().await;
     engine.close().await
 }
 
-async fn application_shutdown() {
-}
+async fn run_application_loop() {}
 ```
 
-Calling `close` is the application policy decision; the SDK only guarantees
-safe teardown once it is called.
+A complete compilable form is available in
+[`examples/engine.rs`](examples/engine.rs).
 
-## Configuration defaults
+## Connection lifecycle
 
-| Option | Default |
-|---|---|
-| `max_sessions` | `1` |
-| `supported_encodings` | MessagePack, then JSON |
-| `supported_capabilities` | `CAP_CORRELATION` |
-| `expected_pid` | absent |
-| heartbeat | 30 seconds, 3 missed intervals |
-| fragmentation | 15-second timeout, 16 active sequences per session |
+`Engine::new` stores configuration without touching the transport.
+`connect().await` performs exactly one bounded dial and handshake attempt. It
+receives and validates the 16-byte Go handshake, writes the four-byte ACK,
+writes session assignment, and returns only when the session is usable. It
+never retries.
 
-Set `HeartbeatSettings::disabled` to `true` when the application deliberately
-does not want SDK heartbeat emission or timeout enforcement. Other enabled
-heartbeat values and all fragmentation limits must be positive.
-
-## Callback and send execution
-
-Callbacks are synchronous `Arc<dyn Fn(..) + Send + Sync>` values. Events for
-one session are serialized, while different sessions may execute callbacks
-concurrently on Tokio runtime tasks. A callback should return promptly; it can
-spawn async application work as shown above.
-
-The per-session writer lock preserves the order of sequential awaited sends.
-Concurrent sends follow lock-acquisition order. A stale handle is rejected by
-both opaque `session_id` and local `epoch`, so it cannot address a replacement
+After a terminal disconnect, the engine returns to `Idle`. Reconnection
+requires another explicit `connect` call and creates a higher local epoch.
+Work captured by a previous epoch cannot write to or close the replacement
 session.
 
-Applications may send only `Log` and `Data`. Control traffic is SDK-owned, and
-`Command` is client-to-engine only. Correlated sends require negotiated
-`CAP_CORRELATION` and preserve the supplied `uint32` identifier.
+`close().await` is valid in every state and is idempotent. It cancels a
+connecting attempt, rejects new work, wakes the reader and dispatcher, stops
+heartbeat and fragmentation work, and joins owned tasks within a bounded
+deadline. `Drop` requests the same teardown and aborts remaining owned tasks
+when asynchronous joining is no longer possible.
 
-## Conformance
+## Configuration
 
-The native test runner implements EC-001 through EC-064 from
-`yuumi-spec/ENGINE_CONFORMANCE.md` and consumes the canonical binary vectors
-from the sibling `yuumi-spec/test-vectors` directory.
+`EngineConfig::new` requires an endpoint name and a 32-character lowercase
+hexadecimal token. Defaults are:
+
+- MessagePack preferred over JSON;
+- `CAP_CORRELATION` enabled;
+- 10-second complete dial and handshake timeout;
+- bounded application queue capacity of 64;
+- heartbeat every 30 seconds with a three-interval miss limit;
+- fragment expiry after 15 seconds and at most 16 active sequences.
+
+`heartbeat.disabled` is the explicit opt-out. `expected_go_pid` is an
+optional additional check of the PID carried by the handshake; zero is
+distinct from absence.
+
+The canonical address is:
 
 ```text
+Windows: \\.\pipe\yuumi-<endpoint_name>-<token>
+Unix:   <system-temp-dir>/yuumi-<first-32-hex-of-SHA-256>.sock
+```
+
+The Unix digest input is the exact UTF-8 byte sequence
+`yuumi NUL endpoint_name NUL token`. macOS rejects a pathname longer than 103
+encoded bytes before dialing. The helper remains internal because arbitrary or
+public transport addresses are outside the Engine API.
+
+## Callbacks and backpressure
+
+Callbacks use stable synchronous `Arc<dyn Fn + Send + Sync>` values. One
+dispatcher invokes events for a session in wire order without overlap. The
+reader, heartbeat worker, writes, and frame parser never invoke application
+logic directly.
+
+A callback should return promptly. It may use `tokio::spawn` for asynchronous
+application work, including `Responder::respond`. A CPU-bound callback
+occupies one Tokio worker thread; applications needing stronger isolation
+should move that work to a dedicated executor.
+
+The application queue is bounded. When full, the engine stops accepting
+application events, closes the session, drains accepted events in order, and
+then delivers the reserved backpressure error and disconnected event. No event
+is silently dropped while the session continues.
+
+Applications may send only `Channel::Log` and `Channel::Data`.
+`Responder` is present only for correlated inbound traffic, is single-use,
+is bound to the captured epoch, and always responds on `Data`.
+
+## Verification
+
+```text
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
-The crate has no dependencies beyond Tokio, Serde, `serde_json`, and
-`rmp-serde`.
+The native suite implements the 25 canonical Engine cases and consumes frozen
+vectors from the sibling `yuumi-spec/test-vectors` directory.
+
+The authoritative contracts are `yuumi-spec/ENGINE_API.md`,
+`yuumi-spec/ENGINE_CONFORMANCE.md`, and `yuumi-spec/PROTOCOL.md`.

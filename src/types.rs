@@ -99,23 +99,29 @@ impl TryFrom<u16> for StatusCode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorCategory {
+pub enum ErrorKind {
     Configuration,
-    Endpoint,
+    AddressDerivation,
+    Dial,
+    Timeout,
     Handshake,
     Protocol,
+    Encoding,
+    Capability,
+    Backpressure,
+    SessionClosed,
+    StaleEpoch,
+    Application,
     Transport,
-    Serialization,
-    Session,
     Internal,
+    State,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorPhase {
     Configuration,
-    EndpointProbe,
-    EndpointOpen,
-    Accept,
+    AddressDerivation,
+    Dial,
     HandshakeRead,
     HandshakeValidate,
     AckWrite,
@@ -125,53 +131,71 @@ pub enum ErrorPhase {
     FrameWrite,
     Heartbeat,
     Fragmentation,
+    ApplicationDispatch,
     ApplicationSend,
     Close,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisconnectReason {
-    EngineClose,
+    LocalClose,
     PeerClose,
     HeartbeatTimeout,
     ProtocolFailure,
     TransportFailure,
+    Backpressure,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SessionHandle {
-    pub session_id: String,
-    pub epoch: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineState {
+    Idle,
+    Connecting,
+    Connected,
+    Closing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionView {
-    pub handle: SessionHandle,
+    pub session_id: String,
+    pub epoch: u64,
     pub encoding: Encoding,
     pub capabilities: u32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct MessageEvent {
-    pub session: SessionHandle,
+    pub session: SessionView,
     pub channel: Channel,
     pub payload: Value,
     pub correlation_id: Option<u32>,
+    pub responder: Option<crate::engine::Responder>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeartbeatEvent {
+    pub session: SessionView,
+    pub timestamp: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorInfo {
-    pub category: ErrorCategory,
-    pub status: StatusCode,
-    pub phase: ErrorPhase,
+    pub kind: ErrorKind,
     pub cause: String,
-    pub session: Option<SessionHandle>,
+    pub status: Option<StatusCode>,
+    pub phase: Option<ErrorPhase>,
+    pub epoch: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalResult {
+    pub reason: DisconnectReason,
+    pub error: Option<ErrorInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisconnectEvent {
-    pub session: SessionHandle,
-    pub reason: DisconnectReason,
+    pub session: SessionView,
+    pub terminal: TerminalResult,
 }
 
 #[derive(Debug, Clone)]
@@ -210,10 +234,11 @@ impl Default for FragmentationSettings {
 pub struct EngineConfig {
     pub endpoint_name: String,
     pub token: String,
-    pub max_sessions: usize,
     pub supported_encodings: Vec<Encoding>,
     pub supported_capabilities: u32,
-    pub expected_pid: Option<u32>,
+    pub expected_go_pid: Option<u32>,
+    pub connect_timeout: Duration,
+    pub application_queue_capacity: usize,
     pub heartbeat: HeartbeatSettings,
     pub fragmentation: FragmentationSettings,
 }
@@ -223,10 +248,11 @@ impl EngineConfig {
         Self {
             endpoint_name: endpoint_name.into(),
             token: token.into(),
-            max_sessions: 1,
             supported_encodings: vec![Encoding::MessagePack, Encoding::Json],
             supported_capabilities: CAP_CORRELATION,
-            expected_pid: None,
+            expected_go_pid: None,
+            connect_timeout: Duration::from_secs(10),
+            application_queue_capacity: 64,
             heartbeat: HeartbeatSettings::default(),
             fragmentation: FragmentationSettings::default(),
         }
@@ -240,23 +266,26 @@ pub struct EngineError {
 
 impl EngineError {
     pub(crate) fn new(
-        category: ErrorCategory,
-        status: StatusCode,
-        phase: ErrorPhase,
+        kind: ErrorKind,
         cause: impl Into<String>,
-        session: Option<SessionHandle>,
+        status: Option<StatusCode>,
+        phase: Option<ErrorPhase>,
+        epoch: Option<u64>,
     ) -> Self {
         Self {
             info: ErrorInfo {
-                category,
+                kind,
+                cause: cause.into(),
                 status,
                 phase,
-                cause: cause.into(),
-                session,
+                epoch,
             },
         }
     }
-    pub fn code(&self) -> StatusCode {
+    pub fn kind(&self) -> ErrorKind {
+        self.info.kind
+    }
+    pub fn code(&self) -> Option<StatusCode> {
         self.info.status
     }
 }
@@ -265,8 +294,8 @@ impl fmt::Display for EngineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "[YUUMI_ERR][{}] {}",
-            self.info.status as u16, self.info.cause
+            "[YUUMI_ERR][{:?}] {}",
+            self.info.kind, self.info.cause
         )
     }
 }
@@ -276,5 +305,6 @@ impl std::error::Error for EngineError {}
 pub type Result<T> = std::result::Result<T, EngineError>;
 pub type ConnectedCallback = Arc<dyn Fn(SessionView) + Send + Sync>;
 pub type MessageCallback = Arc<dyn Fn(MessageEvent) + Send + Sync>;
+pub type HeartbeatCallback = Arc<dyn Fn(HeartbeatEvent) + Send + Sync>;
 pub type ErrorCallback = Arc<dyn Fn(ErrorInfo) + Send + Sync>;
 pub type DisconnectedCallback = Arc<dyn Fn(DisconnectEvent) + Send + Sync>;
