@@ -6,6 +6,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use yuumi::{Engine, EngineConfig, SessionView, CAP_CORRELATION, MAGIC, PROTOCOL_VERSION};
 
 pub const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+pub const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub trait PeerIo: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -63,7 +65,7 @@ pub async fn establish_with(
     config: &EngineConfig,
     packet: [u8; 16],
 ) -> Established {
-    let listener = TestListener::bind(config).await;
+    let listener = GoListener::bind(config).await;
     let peer = tokio::spawn(async move {
         let mut stream = listener.accept().await;
         stream.write_all(&packet).await.unwrap();
@@ -83,13 +85,13 @@ pub async fn establish_with(
 }
 
 #[cfg(unix)]
-pub struct TestListener {
+pub struct GoListener {
     inner: tokio::net::UnixListener,
     address: PathBuf,
 }
 
 #[cfg(unix)]
-impl TestListener {
+impl GoListener {
     pub async fn bind(config: &EngineConfig) -> Self {
         let address = address(config);
         let _ = std::fs::remove_file(&address);
@@ -104,19 +106,19 @@ impl TestListener {
 }
 
 #[cfg(unix)]
-impl Drop for TestListener {
+impl Drop for GoListener {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.address);
     }
 }
 
 #[cfg(windows)]
-pub struct TestListener {
+pub struct GoListener {
     inner: tokio::net::windows::named_pipe::NamedPipeServer,
 }
 
 #[cfg(windows)]
-impl TestListener {
+impl GoListener {
     pub async fn bind(config: &EngineConfig) -> Self {
         use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
         let inner = ServerOptions::new()
@@ -149,14 +151,14 @@ pub fn address(config: &EngineConfig) -> PathBuf {
     }
 }
 
-pub async fn wait_until(mut predicate: impl FnMut() -> bool) {
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+pub async fn wait_until(mut predicate: impl FnMut() -> bool, diagnostic: &str) {
+    tokio::time::timeout(TEST_TIMEOUT, async {
         while !predicate() {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| panic!("timed out waiting for {diagnostic}"));
 }
 
 pub fn vector(name: &str) -> Vec<u8> {

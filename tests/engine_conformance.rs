@@ -103,7 +103,7 @@ async fn ec_005_invalid_handshake_writes_nothing() {
     ] {
         let value = config();
         let engine = Engine::new(value.clone());
-        let listener = TestListener::bind(&value).await;
+        let listener = GoListener::bind(&value).await;
         let mut packet = handshake(3, 1);
         packet[offset..offset + 4].copy_from_slice(&0u32.to_be_bytes());
         let peer = tokio::spawn(async move {
@@ -148,7 +148,7 @@ async fn ec_007_ack_and_assignment_establish_in_order() {
 async fn ec_008_establishment_failure_creates_no_session() {
     let value = config();
     let engine = Engine::new(value.clone());
-    let listener = TestListener::bind(&value).await;
+    let listener = GoListener::bind(&value).await;
     let peer = tokio::spawn(async move { drop(listener.accept().await) });
     let error = engine.connect().await.unwrap_err();
     assert_eq!(error.kind(), ErrorKind::Handshake);
@@ -161,10 +161,14 @@ async fn ec_008_establishment_failure_creates_no_session() {
 async fn ec_009_duplicate_connect_is_rejected_by_state() {
     let value = config();
     let engine = Engine::new(value.clone());
-    let listener = TestListener::bind(&value).await;
+    let listener = GoListener::bind(&value).await;
     let first_engine = engine.clone();
     let first = tokio::spawn(async move { first_engine.connect().await });
-    wait_until(|| engine.state() == EngineState::Connecting).await;
+    wait_until(
+        || engine.state() == EngineState::Connecting,
+        "EC-009 engine to enter connecting",
+    )
+    .await;
     assert_eq!(engine.connect().await.unwrap_err().kind(), ErrorKind::State);
     let mut peer = listener.accept().await;
     peer.write_all(&handshake(3, 1)).await.unwrap();
@@ -221,7 +225,11 @@ async fn ec_012_malformed_frames_never_partially_deliver() {
         .await
         .unwrap();
     read_frame(&mut session.stream).await;
-    wait_until(|| engine.state() == EngineState::Idle).await;
+    wait_until(
+        || engine.state() == EngineState::Idle,
+        "EC-013 fragment timeout",
+    )
+    .await;
     assert!(messages.lock().unwrap().is_empty());
 }
 
@@ -247,7 +255,11 @@ async fn ec_013_fragmentation_is_bounded_and_epoch_local() {
         .write_all(&vector("frame_fragment_last.bin"))
         .await
         .unwrap();
-    wait_until(|| !messages.lock().unwrap().is_empty()).await;
+    wait_until(
+        || !messages.lock().unwrap().is_empty(),
+        "EC-013 fragmented message",
+    )
+    .await;
     assert_eq!(messages.lock().unwrap()[0], "Hello World");
     engine.close().await.unwrap();
 }
@@ -268,7 +280,11 @@ async fn ec_014_responder_is_data_correlated_and_single_use() {
         .write_all(&vector("frame_correlated_request.bin"))
         .await
         .unwrap();
-    wait_until(|| responder.lock().unwrap().is_some()).await;
+    wait_until(
+        || responder.lock().unwrap().is_some(),
+        "EC-014 correlated responder",
+    )
+    .await;
     let responder = responder.lock().unwrap().clone().unwrap();
     responder.respond(&json!({"ok":true})).await.unwrap();
     let response = read_frame(&mut session.stream).await;
@@ -350,7 +366,11 @@ async fn ec_017_ipc_progresses_while_handler_is_slow() {
         .write_all(&json_frame(Channel::Command, json!({"slow":true})))
         .await
         .unwrap();
-    wait_until(|| started.load(Ordering::Acquire)).await;
+    wait_until(
+        || started.load(Ordering::Acquire),
+        "EC-017 slow handler barrier",
+    )
+    .await;
     session
         .stream
         .write_all(&vector("control_ping.bin"))
@@ -360,7 +380,11 @@ async fn ec_017_ipc_progresses_while_handler_is_slow() {
         .await
         .unwrap();
     assert_eq!(pong.0, Channel::Control as u8);
-    wait_until(|| finished.load(Ordering::Acquire)).await;
+    wait_until(
+        || finished.load(Ordering::Acquire),
+        "EC-017 slow handler release",
+    )
+    .await;
     engine.close().await.unwrap();
 }
 
@@ -382,14 +406,26 @@ async fn ec_018_queue_full_is_terminal_and_reserved_events_are_delivered() {
         observed.lock().unwrap().push(error.kind)
     }));
     let mut session = establish_with(&engine, &value, handshake(1, 1)).await;
-    wait_until(|| started.load(Ordering::Acquire)).await;
+    wait_until(
+        || started.load(Ordering::Acquire),
+        "EC-018 backpressure barrier",
+    )
+    .await;
     session
         .stream
         .write_all(&json_frame(Channel::Command, json!({"n":1})))
         .await
         .unwrap();
-    wait_until(|| engine.state() == EngineState::Idle).await;
-    wait_until(|| errors.lock().unwrap().contains(&ErrorKind::Backpressure)).await;
+    wait_until(
+        || engine.state() == EngineState::Idle,
+        "EC-018 terminal idle state",
+    )
+    .await;
+    wait_until(
+        || errors.lock().unwrap().contains(&ErrorKind::Backpressure),
+        "EC-018 backpressure diagnostic",
+    )
+    .await;
     engine.close().await.unwrap();
 }
 
@@ -410,7 +446,11 @@ async fn ec_019_callback_panic_is_observable_application_error() {
         .write_all(&json_frame(Channel::Command, json!({})))
         .await
         .unwrap();
-    wait_until(|| errors.lock().unwrap().contains(&ErrorKind::Application)).await;
+    wait_until(
+        || errors.lock().unwrap().contains(&ErrorKind::Application),
+        "EC-019 application diagnostic",
+    )
+    .await;
     engine.close().await.unwrap();
 }
 
@@ -420,7 +460,11 @@ async fn ec_020_disconnect_clears_session_state_before_idle() {
     let engine = Engine::new(value.clone());
     let session = establish(&engine, &value).await;
     drop(session.stream);
-    wait_until(|| engine.state() == EngineState::Idle).await;
+    wait_until(
+        || engine.state() == EngineState::Idle,
+        "EC-020 disconnect idle state",
+    )
+    .await;
     assert!(engine.session().is_none());
     assert_eq!(
         engine.terminal_result().unwrap().reason,
@@ -444,10 +488,18 @@ async fn ec_021_replacement_epoch_rejects_stale_responder() {
         .write_all(&vector("frame_correlated_request.bin"))
         .await
         .unwrap();
-    wait_until(|| responder.lock().unwrap().is_some()).await;
+    wait_until(
+        || responder.lock().unwrap().is_some(),
+        "EC-021 stale responder capture",
+    )
+    .await;
     let stale = responder.lock().unwrap().clone().unwrap();
     drop(first.stream);
-    wait_until(|| engine.state() == EngineState::Idle).await;
+    wait_until(
+        || engine.state() == EngineState::Idle,
+        "EC-021 replacement idle state",
+    )
+    .await;
     let second = establish_with(&engine, &value, handshake(1, 1)).await;
     assert!(second.view.epoch > first.view.epoch);
     assert_eq!(
@@ -503,7 +555,7 @@ fn ec_024_environment_adapter_is_explicitly_absent() {
 async fn ec_025_close_cancels_connect_and_has_no_extra_dependencies() {
     let value = config();
     let engine = Engine::new(value.clone());
-    let listener = TestListener::bind(&value).await;
+    let listener = GoListener::bind(&value).await;
     let attempt_engine = engine.clone();
     let connecting = tokio::spawn(async move { attempt_engine.connect().await });
     let _peer = listener.accept().await;

@@ -7,6 +7,7 @@ license = "MIT"
 repository = "https://github.com/YuumiConnectionLibrary/yuumi-rs"
 keywords = ["ipc", "named-pipe", "protocol", "yuumi"]
 categories = ["network-programming"]
+exclude = ["tests/**"]
 
 [package.metadata.yuumi]
 role = "engine"
