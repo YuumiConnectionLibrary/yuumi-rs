@@ -135,10 +135,15 @@ is bound to the captured epoch, and always responds on `Data`.
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
+cargo run --example yuumi_go_integration_adapter
 ```
 
 The native suite implements the 25 canonical Engine cases and consumes frozen
 vectors from the sibling `yuumi-spec/test-vectors` directory.
+The first three commands are standalone verification. The final explicit
+command builds the private fixture and runs the real Go-to-Rust cell through
+the shared tagged Go driver; missing prerequisites fail rather than skip. The
+crate manifest excludes the adapter and fixture sources from package content.
 
 The authoritative contracts are `yuumi-spec/ENGINE_API.md`,
 `yuumi-spec/ENGINE_CONFORMANCE.md`, and `yuumi-spec/PROTOCOL.md`.
