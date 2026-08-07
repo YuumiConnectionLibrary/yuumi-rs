@@ -9,7 +9,7 @@ automatic reconnection policy, or application payload schema.
 
 ## Requirements
 
-- stable Rust with edition 2021 support;
+- Rust 1.97 or newer with edition 2021 support;
 - Linux, macOS, or Windows;
 - Tokio, Serde, `serde_json`, and `rmp-serde`.
 
@@ -147,3 +147,6 @@ crate manifest excludes the adapter and fixture sources from package content.
 
 The authoritative contracts are `yuumi-spec/ENGINE_API.md`,
 `yuumi-spec/ENGINE_CONFORMANCE.md`, and `yuumi-spec/PROTOCOL.md`.
+
+The required CI matrix, immutable spec pin, artifacts, timeout, cleanup, and
+local equivalents are documented in [`CI.md`](CI.md).

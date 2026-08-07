@@ -2,6 +2,7 @@
 name = "yuumi"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.97"
 description = "Rust engine SDK for the Yuumi IPC protocol"
 license = "MIT"
 repository = "https://github.com/YuumiConnectionLibrary/yuumi-rs"

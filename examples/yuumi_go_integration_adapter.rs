@@ -39,6 +39,7 @@ fn main() {
     let status = Command::new("go")
         .args([
             "test",
+            "-v",
             "-tags=interop",
             "-run",
             "^TestGoEngineInterop$",
